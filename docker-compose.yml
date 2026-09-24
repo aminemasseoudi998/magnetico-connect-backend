@@ -1,0 +1,138 @@
+# Magnetico infra — one compose file, TWO isolated Postgres databases.
+#
+#   portal-db : owned by Prisma / portal-backend. Schema lives in
+#               backend/prisma/. Nothing else may write here.
+#   guac-db   : owned by Apache Guacamole. Initialized from the official
+#               initdb.sql of the guacamole image. The portal backend NEVER
+#               connects to this database (it only talks to Guacamole's REST
+#               API in step 9 via the billing daemon).
+#
+# Step 3 scope: portal-db + guac-db + guacd + guacamole.
+# Keycloak, nginx, portal-backend and billing-daemon join in steps 11/12/9 —
+# portal-backend is included below already so steps 4-5 can run locally.
+#
+# Usage:
+#   docker compose up -d portal-db guac-db guacd guacamole   # step 3 only
+#   docker compose up -d --build                             # + portal-backend
+
+name: magnetico
+
+services:
+  portal-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: magnetico
+      POSTGRES_PASSWORD: magnetico
+      POSTGRES_DB: portal
+    ports:
+      - "5432:5432"
+    volumes:
+      - portal-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U magnetico -d portal"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  guac-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: guacamole
+      POSTGRES_PASSWORD: guacamole
+      POSTGRES_DB: guacamole
+    # NOTE: no host port published on purpose — only the guacamole container
+    # should reach this DB. Publish 5433:5432 temporarily if you need psql.
+    volumes:
+      # First boot only: official Guacamole schema, loaded once into a fresh
+      # volume (see guacamole-init/README). Afterwards this mount is unused.
+      - ./guacamole-init:/docker-entrypoint-initdb.d:ro
+      - guac-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U guacamole -d guacamole"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  guacd:
+    image: guacamole/guacd:1.5.5
+    restart: unless-stopped
+    # No published ports — only guacamole talks to guacd (port 4822).
+
+  guacamole:
+    image: guacamole/guacamole:1.5.5
+    restart: unless-stopped
+    depends_on:
+      guac-db:
+        condition: service_healthy
+      guacd:
+        condition: service_started
+    environment:
+      GUACD_HOSTNAME: guacd
+      GUACD_PORT: "4822"
+      POSTGRES_HOSTNAME: guac-db
+      POSTGRES_PORT: "5432"
+      POSTGRES_DATABASE: guacamole
+      POSTGRES_USER: guacamole
+      POSTGRES_PASSWORD: guacamole
+      # TODO(secrets, step 14): move these into a managed secret store.
+      GUACAMOLE_ADMIN_USER: guacadmin
+      GUACAMOLE_ADMIN_PASSWORD: guacadmin
+      # Step 7: shared 128-bit key (32 hex digits) enabling the bundled
+      # guacamole-auth-json extension. MUST equal the backend's
+      # GUAC_JSON_AUTH_SECRET. Unset/empty = JSON auth stays disabled
+      # (JDBC login only) — same as before step 7.
+      JSON_SECRET_KEY: ${GUAC_JSON_AUTH_SECRET:-}
+    ports:
+      - "8085:8080"
+
+  portal-backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      portal-db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://magnetico:magnetico@portal-db:5432/portal?schema=public
+      PORT: "4000"
+      STUB_USER_ID: ${STUB_USER_ID:-00000000-0000-0000-0000-000000000001}
+      STUB_KEYCLOAK_SUB: ${STUB_KEYCLOAK_SUB:-stub-sub-dev-only}
+      STUB_EMAIL: ${STUB_EMAIL:-dev@magnetico.local}
+      STUB_DISPLAY_NAME: ${STUB_DISPLAY_NAME:-Dev User}
+      GUAC_BASE_URL: ${GUAC_BASE_URL:-http://localhost:8085/guacamole}
+      HOLD_MINUTES_DEFAULT: ${HOLD_MINUTES_DEFAULT:-60}
+      # Step 7: real JSON-auth tokens need the same 128-bit key as Guacamole's
+      # JSON_SECRET_KEY above (32 hex digits). Unset = dev stub tokens.
+      GUAC_JSON_AUTH_SECRET: ${GUAC_JSON_AUTH_SECRET:-}
+      # Step 7: per-connection parameters keyed by guac_connection_id.
+      # Hostnames must resolve INSIDE the compose network.
+      GUAC_CONNECTION_PARAMS: ${GUAC_CONNECTION_PARAMS:-{}}
+    ports:
+      - "4000:4000"
+
+  # Step 9: metering loop — Guacamole activity in, holds/charges/refunds out.
+  billing-daemon:
+    build:
+      context: ../billing-daemon
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      portal-db:
+        condition: service_healthy
+      guacamole:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://magnetico:magnetico@portal-db:5432/portal?schema=public
+      GUAC_BASE_URL: http://guacamole:8080/guacamole
+      GUAC_ADMIN_USER: ${GUAC_ADMIN_USER:-guacadmin}
+      GUAC_ADMIN_PASSWORD: ${GUAC_ADMIN_PASSWORD:-guacadmin}
+      GUAC_DATA_SOURCES: ${GUAC_DATA_SOURCES:-postgresql,json}
+      POLL_INTERVAL_MS: ${POLL_INTERVAL_MS:-30000}
+      TOKEN_GRACE_MS: ${TOKEN_GRACE_MS:-120000}
+
+volumes:
+  portal-db-data:
+  guac-db-data:
