@@ -1,3 +1,7 @@
+// Must stay first: loads backend/.env so the server and Prisma see it
+// without requiring shell exports. Shell variables still win over the file.
+import "dotenv/config";
+
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import swagger from "@fastify/swagger";
