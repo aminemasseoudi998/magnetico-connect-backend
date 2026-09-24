@@ -10,7 +10,7 @@ import type { FastifySwaggerUiOptions } from "@fastify/swagger-ui";
  *
  * Auth: every /api/* route except /api/health requires a Keycloak access
  * token (`bearerAuth`, applied globally below). /api/admin/* additionally
- * requires the `admin` realm role.
+ * requires the `admin` role stored on the user row.
  */
 export const openapiOptions: FastifyDynamicSwaggerOptions = {
   openapi: {
@@ -22,7 +22,7 @@ export const openapiOptions: FastifyDynamicSwaggerOptions = {
         "Metered remote-access portal. Billing: balance = SUM(topup) + SUM(refund) - SUM(charge); " +
         "`hold` rows are reservations and never count toward the balance. " +
         "Auth: Keycloak access token as `Authorization: Bearer <jwt>` on every /api/* route except /api/health. " +
-        "/api/admin/* additionally requires the `admin` realm role.",
+        "/api/admin/* additionally requires the `admin` role stored on the user row.",
     },
     servers: [{ url: "http://localhost:4000", description: "Local dev" }],
     components: {
@@ -36,6 +36,7 @@ export const openapiOptions: FastifyDynamicSwaggerOptions = {
       { name: "resources", description: "Entitled servers for the authenticated user" },
       { name: "sessions", description: "Create metered sessions, read history" },
       { name: "wallet", description: "Balance, top-ups, ledger" },
+      { name: "admin", description: "Org-wide operator administration (admin role only)" },
     ],
   },
   hideUntagged: true,
@@ -61,6 +62,18 @@ export const protocolSchema = { type: "string", enum: ["ssh", "rdp"] } as const;
 export const ledgerTypeSchema = {
   type: "string",
   enum: ["topup", "hold", "charge", "refund"],
+} as const;
+
+/** Portal role stored on `users.role`. */
+export const operatorRoleSchema = {
+  type: "string",
+  enum: ["admin", "engineer", "analyst"],
+} as const;
+
+/** Account states an admin can set (`deleted` is not reachable from the UI). */
+export const operatorStatusSchema = {
+  type: "string",
+  enum: ["active", "suspended"],
 } as const;
 
 export const sessionStatusSchema = {

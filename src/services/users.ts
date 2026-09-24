@@ -1,4 +1,4 @@
-import { Prisma, type PrismaClient, type User } from "@prisma/client";
+import { Prisma, type PrismaClient, type User, type UserRole } from "@prisma/client";
 
 /**
  * Maps a verified Keycloak identity onto a Portal `users` row.
@@ -17,6 +17,12 @@ export type Identity = {
   email: string;
   emailVerified: boolean;
   displayName: string;
+  /**
+   * Realm role on the token. Used ONLY to seed `users.role` on the row's
+   * first creation — never to update an existing row, so a role change made
+   * in the admin console survives the next sign-in.
+   */
+  seedRole: UserRole;
 };
 
 export async function resolveUser(
@@ -49,6 +55,7 @@ export async function resolveUser(
         keycloakSub: identity.keycloakSub,
         email: identity.email,
         displayName: identity.displayName,
+        role: identity.seedRole,
       },
     });
   } catch (err) {

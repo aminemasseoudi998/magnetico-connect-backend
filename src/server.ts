@@ -9,6 +9,7 @@ import swaggerUi from "@fastify/swagger-ui";
 import { authPlugin } from "./plugins/auth.js";
 import { prismaPlugin } from "./plugins/prisma.js";
 import { openapiOptions, swaggerUiOptions } from "./plugins/swagger.js";
+import { adminRoutes } from "./routes/admin.js";
 import { resourceRoutes } from "./routes/resources.js";
 import { sessionRoutes } from "./routes/sessions.js";
 import { systemRoutes } from "./routes/system.js";
@@ -36,6 +37,7 @@ export function buildServer() {
   void fastify.register(resourceRoutes);
   void fastify.register(sessionRoutes);
   void fastify.register(walletRoutes);
+  void fastify.register(adminRoutes);
 
   return fastify;
 }

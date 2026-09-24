@@ -100,6 +100,11 @@ docs: **`GET /docs`** (Swagger UI, spec at `/docs/json`).
 | `GET` | `/api/wallet/balance` | Derived balance: `SUM(topup)+SUM(refund)−SUM(charge)`; holds excluded. |
 | `POST` | `/api/wallet/topup` `{amount}` | Appends a `topup` leg (stub credit — real PSP later). |
 | `GET` | `/api/wallet/transactions` | Full ledger + balance (`?limit`, 1–500). |
+| `GET` | `/api/admin/operators` | **admin** — accounts with derived balance, 30-day spend and session count, plus `counts` per state. `?q` matches display name, email or team (case-insensitive, matched in Postgres); `?status=active\|suspended`. `counts` facets on `q` only, ignoring `status`. |
+| `GET` | `/api/admin/operators/:id` | **admin** — one account. `404 operator_not_found`. |
+| `PATCH` | `/api/admin/operators/:id` | **admin** — `{role?, team?, status?}`. `403 cannot_modify_self` on self-demotion or self-suspension. |
+| `POST` | `/api/admin/operators/:id/credit` `{amount}` | **admin** — appends a `topup` ledger entry to that account. |
+| `GET` | `/api/admin/operators/:id/sessions` | **admin** — that operator's session history (`?limit`, 1–200). |
 
 Ledger rule (enforced by convention, relied on by the billing daemon):
 `ledger_entries` is **append-only** — only `INSERT`, never `UPDATE`/`DELETE`;

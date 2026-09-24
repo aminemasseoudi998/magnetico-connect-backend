@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { requireAuth } from "../plugins/auth.js";
+import { operatorRoleSchema } from "../plugins/swagger.js";
 
 /**
  * System routes: public liveness probe + authenticated identity echo.
@@ -37,7 +38,7 @@ export async function systemRoutes(fastify: FastifyInstance): Promise<void> {
       schema: {
         tags: ["health"],
         summary: "Current identity",
-        description: "The authenticated user and their portal role (admin | user).",
+        description: "The authenticated user and their portal role, as stored on the user row.",
         response: {
           200: {
             type: "object",
@@ -49,7 +50,7 @@ export async function systemRoutes(fastify: FastifyInstance): Promise<void> {
                   keycloakSub: { type: "string" },
                   email: { type: "string" },
                   displayName: { type: "string" },
-                  role: { type: "string", enum: ["admin", "user"] },
+                  role: operatorRoleSchema,
                 },
               },
             },

@@ -23,6 +23,15 @@ enum UserStatus {
   deleted
 }
 
+// Portal role. Seeded from the Keycloak realm role at first sign-in, then
+// owned by this table: the admin console edits it and the token no longer
+// overrides it (see plugins/auth.ts).
+enum UserRole {
+  admin
+  engineer
+  analyst
+}
+
 enum SessionStatus {
   pending
   active
@@ -44,6 +53,9 @@ model User {
   email       String     @unique
   displayName String     @map("display_name")
   status      UserStatus @default(active)
+  role        UserRole   @default(engineer)
+  // Free-form org unit shown in the admin console. Null until an admin sets it.
+  team        String?
   createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
 
   entitlements Entitlement[]

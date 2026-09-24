@@ -13,6 +13,11 @@ import { resolveUser, UserConflictError } from "../services/users.js";
  * cached by jose), with issuer + audience + expiry checks. The `sub` claim is
  * then upserted into `users` and the row id is attached as `request.user.id`.
  *
+ * Roles live in `users.role`, not in the token: the realm role only seeds a
+ * brand-new row (see services/users.ts). `requireAdmin` therefore reads the
+ * stored role, so a promotion or demotion made in the admin console takes
+ * effect on the holder's next request rather than their next sign-in.
+ *
  * Contract:
  *   - protected routes declare `preHandler: [requireAuth]`
  *   - admin-only routes live under /api/admin/* (enforced globally below)
@@ -56,11 +61,15 @@ function getVerifier(): Verifier {
   return verifier;
 }
 
-/** Highest portal role in the token, or null when it carries neither. */
-export function roleFromClaims(claims: KeycloakClaims): PortalRole | null {
+/**
+ * Role to give a brand-new `users` row, or null when the token carries no
+ * portal realm role at all (-> 403 no_role). Existing rows keep their stored
+ * role regardless of what the token says.
+ */
+export function seedRoleFromClaims(claims: KeycloakClaims): PortalRole | null {
   const roles = claims.realm_access?.roles ?? [];
   if (roles.includes("admin")) return "admin";
-  if (roles.includes("user")) return "user";
+  if (roles.includes("user")) return "engineer";
   return null;
 }
 
@@ -106,8 +115,8 @@ export async function requireAuth(
     return reply.code(401).send({ error: "unauthorized" });
   }
 
-  const role = roleFromClaims(claims);
-  if (role === null) {
+  const seedRole = seedRoleFromClaims(claims);
+  if (seedRole === null) {
     return reply.code(403).send({ error: "no_role" });
   }
 
@@ -118,6 +127,7 @@ export async function requireAuth(
       email: claims.email,
       emailVerified: claims.email_verified === true,
       displayName: claims.name ?? claims.preferred_username ?? claims.email,
+      seedRole,
     });
   } catch (err) {
     if (err instanceof UserConflictError) {
@@ -134,7 +144,8 @@ export async function requireAuth(
     keycloakSub: user.keycloakSub,
     email: user.email,
     displayName: user.displayName,
-    role,
+    // Stored role wins over the token — see the module comment.
+    role: user.role,
   };
   request.user = authUser;
 }

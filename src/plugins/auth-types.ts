@@ -1,12 +1,20 @@
 import type { FastifyRequest } from "fastify";
 
 /**
- * Portal roles, sourced from Keycloak realm roles (`realm_access.roles`).
- * Every Google sign-in gets `user` through the realm's default roles; `admin`
- * is granted by hand in the Keycloak admin console. `admin` wins when a token
- * carries both.
+ * Portal roles, owned by `users.role`.
+ *
+ * Keycloak authenticates and seeds the role at first sign-in (its realm role
+ * `admin` becomes `admin`, anything else becomes `engineer`); from then on
+ * this table is the source of truth and the admin console edits it. A token
+ * whose realm role later disagrees does NOT override the stored role —
+ * otherwise a demotion made here would be undone at the next sign-in.
  */
-export type PortalRole = "admin" | "user";
+export type PortalRole = "admin" | "engineer" | "analyst";
+
+/** Roles allowed to open a metered session (an analyst is read-only). */
+export function canOpenSessions(role: PortalRole): boolean {
+  return role === "admin" || role === "engineer";
+}
 
 /** Identity attached to every authenticated request (verified Keycloak JWT). */
 export type AuthUser = {
