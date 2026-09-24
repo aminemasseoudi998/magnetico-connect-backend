@@ -1,0 +1,141 @@
+{
+  "realm": "magnetico",
+  "displayName": "Magnetico",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "resetPasswordAllowed": false,
+  "rememberMe": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "accessTokenLifespan": 300,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "roles": {
+    "realm": [
+      {
+        "name": "user",
+        "description": "Portal user: own dashboard, resources, wallet and history."
+      },
+      {
+        "name": "admin",
+        "description": "Portal administrator: operations, fleet, operators and org-wide sessions."
+      },
+      {
+        "name": "offline_access",
+        "description": "Offline access"
+      },
+      {
+        "name": "uma_authorization",
+        "description": "UMA authorization"
+      },
+      {
+        "name": "default-roles-magnetico",
+        "description": "Default roles for every new account",
+        "composite": true,
+        "composites": {
+          "realm": [
+            "offline_access",
+            "uma_authorization",
+            "user"
+          ]
+        }
+      }
+    ]
+  },
+  "defaultRole": {
+    "name": "default-roles-magnetico",
+    "description": "Default roles for every new account",
+    "composite": true,
+    "clientRole": false
+  },
+  "clients": [
+    {
+      "clientId": "magnetico-portal",
+      "name": "Magnetico Portal",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "${PORTAL_CLIENT_SECRET}",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "frontchannelLogout": true,
+      "rootUrl": "${PORTAL_URL}",
+      "baseUrl": "/",
+      "redirectUris": [
+        "${PORTAL_URL}/oauth/callback"
+      ],
+      "webOrigins": [
+        "${PORTAL_URL}"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "${PORTAL_URL}/login"
+      },
+      "protocolMappers": [
+        {
+          "name": "portal-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "magnetico-portal",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "identityProviders": [
+    {
+      "alias": "google",
+      "displayName": "Google",
+      "providerId": "google",
+      "enabled": true,
+      "trustEmail": true,
+      "storeToken": false,
+      "addReadTokenRoleOnCreate": false,
+      "linkOnly": false,
+      "firstBrokerLoginFlowAlias": "first broker login",
+      "config": {
+        "clientId": "${GOOGLE_CLIENT_ID}",
+        "clientSecret": "${GOOGLE_CLIENT_SECRET}",
+        "defaultScope": "openid profile email",
+        "syncMode": "IMPORT",
+        "useJwksUrl": "true",
+        "prompt": "consent select_account"
+      }
+    }
+  ],
+  "components": {
+    "org.keycloak.userprofile.UserProfileProvider": [
+      {
+        "providerId": "declarative-user-profile",
+        "subComponents": {},
+        "config": {
+          "kc.user.profile.config": [
+            "{\"attributes\":[{\"name\":\"username\",\"displayName\":\"Username\",\"validations\":{\"length\":{\"min\":3,\"max\":255},\"username-prohibited-characters\":{},\"up-username-not-idn-homograph\":{}},\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\",\"user\"]},\"multivalued\":false},{\"name\":\"email\",\"displayName\":\"Email\",\"validations\":{\"email\":{},\"length\":{\"max\":255}},\"required\":{\"roles\":[\"user\"]},\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\",\"user\"]},\"multivalued\":false},{\"name\":\"firstName\",\"displayName\":\"First name\",\"validations\":{\"length\":{\"max\":255},\"person-name-prohibited-characters\":{}},\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\",\"user\"]},\"multivalued\":false},{\"name\":\"lastName\",\"displayName\":\"Last name\",\"validations\":{\"length\":{\"max\":255},\"person-name-prohibited-characters\":{}},\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\",\"user\"]},\"multivalued\":false}],\"groups\":[{\"name\":\"user-metadata\",\"displayHeader\":\"User metadata\",\"displayDescription\":\"Attributes, which refer to user metadata\"}]}"
+          ]
+        }
+      }
+    ]
+  },
+  "identityProviderMappers": [
+    {
+      "name": "admin-by-email",
+      "identityProviderAlias": "google",
+      "identityProviderMapper": "oidc-advanced-role-idp-mapper",
+      "config": {
+        "syncMode": "FORCE",
+        "claims": "[{\"key\":\"email\",\"value\":\"${ADMIN_EMAILS_REGEX}\"}]",
+        "are.claim.values.regex": "true",
+        "role": "admin"
+      }
+    }
+  ]
+}

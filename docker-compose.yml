@@ -1,0 +1,89 @@
+# Magnetico — identity + portal database.
+#
+# Scope for now: Google sign-in through Keycloak, and the Portal Postgres.
+# Guacamole, guacd, billing-daemon and nginx join this file later.
+#
+#   cp .env.example .env    # fill in the Google OAuth client + secrets
+#   docker compose up -d
+#
+# Host ports: 5432 portal-db · 8180 Keycloak (http://localhost:8180/auth)
+
+name: magnetico
+
+services:
+  # Portal database — the only DB the backend (Prisma) touches.
+  portal-db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: portal
+      POSTGRES_USER: ${PORTAL_DB_USER:-magnetico}
+      POSTGRES_PASSWORD: ${PORTAL_DB_PASSWORD:-magnetico}
+    ports:
+      - "5432:5432"
+    volumes:
+      - portal-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Keycloak's own database, isolated from the Portal DB. Not published.
+  keycloak-db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: ${KEYCLOAK_DB_PASSWORD:-keycloak}
+    volumes:
+      - keycloak-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak -d keycloak"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Identity: realm "magnetico", brokering Google. Served under /auth so the
+  # later nginx rule (/auth/* -> keycloak) needs no path rewriting.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3
+    restart: unless-stopped
+    # Turns ADMIN_EMAILS ("a@x.com, b@y.com") into the anchored regex the
+    # realm's admin-by-email mapper matches Google's `email` claim against.
+    # "." and "+" become [.] / [+] so john.smith@ can't be matched by
+    # johnXsmith@. Empty list -> a pattern no real email can match.
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        e="$${ADMIN_EMAILS,,}"; e="$${e// /}"; e="$${e//./[.]}"; e="$${e//+/[+]}"; e="$${e//,/|}"
+        export ADMIN_EMAILS_REGEX="^($${e:-no-admin-configured})$$"
+        exec /opt/keycloak/bin/kc.sh start-dev --import-realm
+    depends_on:
+      keycloak-db:
+        condition: service_healthy
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:-keycloak}
+      KC_HTTP_RELATIVE_PATH: /auth
+      KC_HEALTH_ENABLED: "true"
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USER:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      # Substituted into keycloak/magnetico-realm.json at import time.
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:?set GOOGLE_CLIENT_ID in infra/.env}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:?set GOOGLE_CLIENT_SECRET in infra/.env}
+      PORTAL_CLIENT_SECRET: ${PORTAL_CLIENT_SECRET:?set PORTAL_CLIENT_SECRET in infra/.env}
+      PORTAL_URL: ${PORTAL_URL:-http://localhost:3000}
+      ADMIN_EMAILS: ${ADMIN_EMAILS:-}
+    ports:
+      - "8180:8080"
+    volumes:
+      - ./keycloak/magnetico-realm.json:/opt/keycloak/data/import/magnetico-realm.json:ro
+
+volumes:
+  portal-db-data:
+  keycloak-db-data:
