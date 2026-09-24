@@ -2,7 +2,6 @@ import type { FastifyInstance } from "fastify";
 import { requireAuth } from "../plugins/auth.js";
 import { getAuthUser } from "../plugins/auth-types.js";
 import { protocolSchema } from "../plugins/swagger.js";
-import { ensureUser } from "../services/wallet.js";
 
 /**
  * 1. GET /api/resources — resources the authenticated user is entitled to.
@@ -53,7 +52,6 @@ export async function resourceRoutes(fastify: FastifyInstance): Promise<void> {
     },
     async (request) => {
     const user = getAuthUser(request);
-    await ensureUser(fastify.prisma, user);
 
     const entitlements = await fastify.prisma.entitlement.findMany({
       where: { userId: user.id },

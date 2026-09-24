@@ -6,9 +6,12 @@ database this service ever touches. Guacamole keeps its own isolated Postgres;
 the backend talks to Guacamole solely through signed JSON-auth tokens
 (`POST /api/sessions`) and never connects to its DB.
 
-Auth is currently **stubbed** (prompt.md step 4): every `/api/*` route except
-`/api/health` acts as a fake dev user. Real Keycloak JWT verification lands in
-step 11; the route contract (`request.user.id`) already matches it.
+Auth is **Keycloak** (realm `magnetico`, brokering Google): every `/api/*`
+route except `/api/health` needs `Authorization: Bearer <access token>`,
+verified against the realm JWKS (issuer, audience `magnetico-portal`, expiry).
+The token's `sub` is upserted into `users` on first use. Realm roles decide
+access: `user` for the user console, `admin` for the admin console;
+`/api/admin/*` rejects anyone without `admin` (403).
 
 ## Prerequisites
 
@@ -17,43 +20,27 @@ step 11; the route contract (`request.user.id`) already matches it.
 - Ports: `4000` (API), `5432` (Portal DB via compose), `8085` (Guacamole via
   compose). If a port is taken, override it — see [Troubleshooting](#troubleshooting).
 
-## Run A — full stack with Docker Compose (recommended)
+## Run A — infra with Docker Compose
 
-From `infra/`:
-
-```bash
-docker compose up -d --build
-```
-
-This starts `portal-db`, `guac-db`, `guacd`, `guacamole`, `portal-backend`
-and `billing-daemon`. Two one-time setup steps remain:
+`infra/docker-compose.yml` currently runs **portal-db** (postgres:16),
+**keycloak-db** (postgres:16) and **keycloak** (with the realm imported from
+`infra/keycloak/magnetico-realm.json`). See `infra/README.md` for the Google
+OAuth setup. Then:
 
 ```bash
-# 1. Portal schema (empty volume on first boot — without this every endpoint 500s)
-cd ../backend
-DATABASE_URL="postgresql://magnetico:magnetico@localhost:5432/portal?schema=public" \
-  npx prisma migrate deploy
-
-# 2. Demo data: stub user + 2 entitled resources + 500.00 topup
-DATABASE_URL="postgresql://magnetico:magnetico@localhost:5432/portal?schema=public" \
-  npm run prisma:seed
+cd backend
+cp .env.example .env
+npx prisma migrate deploy   # Portal schema on the fresh volume
+npm run prisma:seed         # demo resources
+npm run dev                 # http://localhost:4000
 ```
 
-The Guacamole DB seeds itself from `infra/guacamole-init/initdb.sql` on first
-boot; nothing to run there. Default logins: Guacamole `guacadmin`/`guacadmin`
-(change in compose), API acts as `dev@magnetico.local`.
-
-Real (non-stub) session tokens additionally need a shared secret visible to
-both services before `up`:
+Sign in once through the frontend (that creates your `users` row), then give
+yourself resources + credit:
 
 ```bash
-export GUAC_JSON_AUTH_SECRET="$(node -e "console.log(require('crypto').randomBytes(16).toString('hex'))")"
-export GUAC_CONNECTION_PARAMS='{"1": {"hostname": "<ssh-host>", "port": "22", "username": "ops", "password": "<pw>"}}'
-docker compose up -d guacamole portal-backend
+npm run grant -- you@gmail.com 500
 ```
-
-Without the secret, `POST /api/sessions` returns a dev stub token (`.stub`
-suffix) — fine for endpoint work, useless for real Guacamole logins.
 
 ## Run B — backend on the host (local dev)
 
@@ -79,15 +66,12 @@ Production-ish local run: `npm run build && npm start`.
 | `DATABASE_URL` | yes | — | Portal Postgres. Never the Guacamole DB. |
 | `PORT` | no | `4000` | HTTP listen port. |
 | `LOG_LEVEL` | no | `info` | Fastify log level. |
-| `STUB_USER_ID` / `STUB_KEYCLOAK_SUB` / `STUB_EMAIL` / `STUB_DISPLAY_NAME` | no | dev user | Fake identity attached by the stub auth middleware. Seed uses the same values — keep them in sync. Removed in step 11 (real JWT). |
+| `KEYCLOAK_ISSUER` | yes | — | Realm issuer, e.g. `http://localhost:8180/auth/realms/magnetico`. Must match the token `iss` exactly (same host the frontend uses). |
+| `KEYCLOAK_AUDIENCE` | no | `magnetico-portal` | Required `aud` in access tokens (audience mapper in the realm import). |
 | `GUAC_BASE_URL` | no | `http://localhost:8085/guacamole` | Guacamole base used to build `guacUrl`. Must match Guacamole's **published host port** (`8085:8080` in compose). |
 | `HOLD_MINUTES_DEFAULT` | no | `60` | Hold window (`rate × minutes`, capped by balance) when an entitlement sets no `max_session_min`. |
 | `GUAC_JSON_AUTH_SECRET` | no | — (stub tokens) | 128-bit key as 32 hex digits. Must equal Guacamole's `JSON_SECRET_KEY`. Generate: `node -e "console.log(require('crypto').randomBytes(16).toString('hex'))"`. |
 | `GUAC_CONNECTION_PARAMS` | iff secret set | `{}` | JSON map `guac_connection_id → {hostname, port, …}`. Hostnames must resolve **from the Guacamole container**. Missing entry → `POST /api/sessions` 500s (`connection_unconfigured`). |
-
-Dev-only escape hatch: any request header `x-user-id: <uuid>` overrides the
-stub identity (multi-user entitlement testing without Keycloak; deleted in
-step 11).
 
 ## Scripts
 
@@ -98,17 +82,18 @@ step 11).
 | `npm run typecheck` | `tsc --noEmit`. |
 | `npm run prisma:generate` | Regenerate the Prisma client after schema edits. |
 | `npm run prisma:migrate` | `migrate dev` — schema iteration (dev DB only). |
-| `npm run prisma:seed` | Stub user + demo resources/entitlements + 500.00 topup. |
+| `npm run prisma:seed` | Demo resources. |
+| `npm run grant -- <email> [amount]` | Entitle a signed-in user to all active resources, optionally top up. |
 
 ## Endpoints
 
-All under `/api/*`, stub-authenticated except `/api/health`. Interactive
+All under `/api/*`, Bearer-authenticated except `/api/health`; `/api/admin/*` is admin-only. Interactive
 docs: **`GET /docs`** (Swagger UI, spec at `/docs/json`).
 
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/health` | Public liveness probe. |
-| `GET` | `/api/me` | Echoes the attached identity (stub debug helper). |
+| `GET` | `/api/me` | Current user + portal role (`admin` \| `user`). |
 | `GET` | `/api/resources` | Entitled, active resources for the user. |
 | `POST` | `/api/sessions` `{resourceId}` | Entitlement + balance check → `pending` session + `hold` → `{sessionId, guacToken, guacUrl}`. Errors: `404` unknown, `403` inactive/no-entitlement, `402` insufficient, `500` token misconfiguration. |
 | `GET` | `/api/sessions/history` | Past sessions with resource + `finalCharge` (`?limit`, 1–200). |
@@ -124,10 +109,12 @@ all amounts are positive magnitudes, the sign lives in `type`.
 
 ```bash
 curl localhost:4000/api/health                       # {"ok":true}
-curl localhost:4000/api/resources                    # 2 demo resources (after seed)
-curl localhost:4000/api/wallet/balance               # {"balance":500} (fresh seed)
-open http://localhost:4000/docs                      # Swagger UI
+curl -i localhost:4000/api/me                        # 401 without a token
+open http://localhost:4000/docs                      # Swagger UI ("Authorize" takes a Bearer token)
 ```
+
+Easiest real check is through the frontend: sign in with Google, the user
+console loads `/api/resources` + wallet via the `/bff` gateway.
 
 ## Troubleshooting
 
@@ -145,6 +132,9 @@ open http://localhost:4000/docs                      # Swagger UI
 - **`guac_token_failed / connection_unconfigured`** — secret is set but
   `GUAC_CONNECTION_PARAMS` has no entry for that resource's
   `guac_connection_id`.
+- **401 on every call with a valid-looking token** — `KEYCLOAK_ISSUER` differs
+  from the token `iss` (e.g. `localhost` vs `127.0.0.1`, or missing `/auth`).
+- **403 `no_role`** — the Keycloak user has neither `user` nor `admin` realm role.
 - **Frontend 500s on `/` or `/resources`** — its server components call this
   API; fix the backend first, then rebuild/restart the frontend. The frontend
   runs separately (`frontend/`, `:3000`); the dashboard is `/`, there is no

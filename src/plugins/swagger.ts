@@ -8,9 +8,9 @@ import type { FastifySwaggerUiOptions } from "@fastify/swagger-ui";
  * would hide sibling routes from the spec — same encapsulation trap as the
  * prisma decorator, see plugins/prisma.ts).
  *
- * Auth is still the step-4 stub (no Bearer scheme yet): every /api/* route
- * except /api/health uses the fake identity. Step 11 adds the real Keycloak
- * `bearerAuth` security scheme here.
+ * Auth: every /api/* route except /api/health requires a Keycloak access
+ * token (`bearerAuth`, applied globally below). /api/admin/* additionally
+ * requires the `admin` realm role.
  */
 export const openapiOptions: FastifyDynamicSwaggerOptions = {
   openapi: {
@@ -21,9 +21,16 @@ export const openapiOptions: FastifyDynamicSwaggerOptions = {
       description:
         "Metered remote-access portal. Billing: balance = SUM(topup) + SUM(refund) - SUM(charge); " +
         "`hold` rows are reservations and never count toward the balance. " +
-        "Auth is currently stubbed (step 4) — all /api/* routes except /api/health act as the dev user.",
+        "Auth: Keycloak access token as `Authorization: Bearer <jwt>` on every /api/* route except /api/health. " +
+        "/api/admin/* additionally requires the `admin` realm role.",
     },
     servers: [{ url: "http://localhost:4000", description: "Local dev" }],
+    components: {
+      securitySchemes: {
+        bearerAuth: { type: "http", scheme: "bearer", bearerFormat: "JWT" },
+      },
+    },
+    security: [{ bearerAuth: [] }],
     tags: [
       { name: "health", description: "Public liveness probe" },
       { name: "resources", description: "Entitled servers for the authenticated user" },

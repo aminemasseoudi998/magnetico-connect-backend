@@ -2,7 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { requireAuth } from "../plugins/auth.js";
 import { getAuthUser } from "../plugins/auth-types.js";
 import { errorResponseSchema, ledgerTypeSchema } from "../plugins/swagger.js";
-import { ensureUser, getBalance } from "../services/wallet.js";
+import { getBalance } from "../services/wallet.js";
 
 const MAX_TOPUP = 1_000_000;
 
@@ -39,7 +39,6 @@ export async function walletRoutes(fastify: FastifyInstance): Promise<void> {
     },
     async (request) => {
     const user = getAuthUser(request);
-    await ensureUser(fastify.prisma, user);
     return { balance: await getBalance(fastify.prisma, user.id) };
   });
 
@@ -82,7 +81,6 @@ export async function walletRoutes(fastify: FastifyInstance): Promise<void> {
       if (!Number.isFinite(amount) || Math.round(amount * 10000) / 10000 !== amount) {
         return reply.code(400).send({ error: "invalid_amount_precision" });
       }
-      await ensureUser(fastify.prisma, user);
       const entry = await fastify.prisma.ledgerEntry.create({
         data: { userId: user.id, type: "topup", amount: amount.toFixed(4) },
       });
@@ -127,7 +125,6 @@ export async function walletRoutes(fastify: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const user = getAuthUser(request);
-      await ensureUser(fastify.prisma, user);
       const [entries, balance] = await Promise.all([
         fastify.prisma.ledgerEntry.findMany({
           where: { userId: user.id },

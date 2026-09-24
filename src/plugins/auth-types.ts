@@ -1,17 +1,22 @@
 import type { FastifyRequest } from "fastify";
 
 /**
- * Identity attached to every authenticated request.
- * Step 11 will populate this from the verified Keycloak JWT (`sub` claim);
- * until then it comes from STUB_* env vars (step 4).
+ * Portal roles, sourced from Keycloak realm roles (`realm_access.roles`).
+ * Every Google sign-in gets `user` through the realm's default roles; `admin`
+ * is granted by hand in the Keycloak admin console. `admin` wins when a token
+ * carries both.
  */
+export type PortalRole = "admin" | "user";
+
+/** Identity attached to every authenticated request (verified Keycloak JWT). */
 export type AuthUser = {
   /** Portal users.id — what Prisma queries filter on. */
   id: string;
-  /** Keycloak `sub` claim. Stubbed for now, real in step 11. */
+  /** Keycloak `sub` claim. */
   keycloakSub: string;
   email: string;
   displayName: string;
+  role: PortalRole;
 };
 
 declare module "fastify" {

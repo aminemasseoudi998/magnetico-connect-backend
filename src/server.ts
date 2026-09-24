@@ -28,11 +28,10 @@ export function buildServer() {
   // Public — the only /api/* route that skips auth (prompt.md §BACKEND API).
   // NOTE: lives in systemRoutes (a plugin registered after swagger) so the
   // OpenAPI collector sees it — see routes/system.ts.
-  // Proves the step-4 middleware works; step-5 endpoints follow this pattern:
-  //   { preHandler: [requireAuth] } + request.user!.id for Prisma scoping.
 
-  // Step 5 — core endpoints, all protected by requireAuth (each route
-  // declares it; the global authPlugin enforces it for /api/* as backstop).
+  // Core endpoints, all protected by requireAuth (each route declares it; the
+  // global authPlugin enforces it for /api/* and requireAdmin for
+  // /api/admin/* as a backstop).
   void fastify.register(systemRoutes);
   void fastify.register(resourceRoutes);
   void fastify.register(sessionRoutes);

@@ -1,74 +1,166 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import fp from "fastify-plugin";
-import type { AuthUser } from "./auth-types.js";
+import { createRemoteJWKSet, errors as joseErrors, jwtVerify, type JWTPayload } from "jose";
+import type { AuthUser, PortalRole } from "./auth-types.js";
+import { resolveUser, UserConflictError } from "../services/users.js";
 
 /**
- * Step 4 — stub auth middleware.
+ * Step 11 — Keycloak JWT verification.
  *
- * Attaches a FAKE userId to every /api/* request (except /api/health) so the
- * step-5 endpoints can be built and tested without a running Keycloak.
+ * Every /api/* request except /api/health must carry
+ * `Authorization: Bearer <access token>` issued by the Keycloak realm that
+ * brokers Google. The token is verified against the realm JWKS (RS256,
+ * cached by jose), with issuer + audience + expiry checks. The `sub` claim is
+ * then upserted into `users` and the row id is attached as `request.user.id`.
  *
- * Contract (stable across stub -> real):
+ * Contract:
  *   - protected routes declare `preHandler: [requireAuth]`
- *   - handlers read identity via `request.user` (always defined past requireAuth)
- *   - unauthenticated access fails with 401 { error: "unauthorized" }
- *
- * TODO(keycloak, step 11): replace getStubUser() with real JWT verification:
- *   1. read `Authorization: Bearer <jwt>`
- *   2. verify signature against Keycloak JWKS (RS256, cached), check iss/aud/exp
- *   3. upsert users row on (keycloak_sub) and attach { id: users.id, ... }
- *   4. delete STUB_* env vars, dev header override, and this file's stub path.
+ *   - admin-only routes live under /api/admin/* (enforced globally below)
+ *     or declare `preHandler: [requireAuth, requireAdmin]`
+ *   - 401 { error: "unauthorized" } — missing / invalid / expired token
+ *   - 403 { error: "forbidden" | "no_role" | "account_suspended" }
  */
 
 const PUBLIC_PATHS = new Set(["/api/health"]);
 
-function getStubUser(): AuthUser {
-  return {
-    id: process.env["STUB_USER_ID"] ?? "00000000-0000-0000-0000-000000000001",
-    keycloakSub: process.env["STUB_KEYCLOAK_SUB"] ?? "stub-sub-dev-only",
-    email: process.env["STUB_EMAIL"] ?? "dev@magnetico.local",
-    displayName: process.env["STUB_DISPLAY_NAME"] ?? "Dev User",
+type KeycloakClaims = JWTPayload & {
+  email?: string;
+  email_verified?: boolean;
+  name?: string;
+  preferred_username?: string;
+  realm_access?: { roles?: string[] };
+};
+
+type Verifier = {
+  issuer: string;
+  audience: string;
+  jwks: ReturnType<typeof createRemoteJWKSet>;
+};
+
+let verifier: Verifier | undefined;
+
+/** Built lazily so importing this module never requires a configured env. */
+function getVerifier(): Verifier {
+  if (verifier !== undefined) return verifier;
+  const issuer = (process.env["KEYCLOAK_ISSUER"] ?? "").replace(/\/$/, "");
+  if (issuer.length === 0) {
+    throw new Error(
+      "KEYCLOAK_ISSUER is not set (e.g. http://localhost:8180/auth/realms/magnetico)",
+    );
+  }
+  verifier = {
+    issuer,
+    audience: process.env["KEYCLOAK_AUDIENCE"] ?? "magnetico-portal",
+    jwks: createRemoteJWKSet(new URL(`${issuer}/protocol/openid-connect/certs`)),
   };
+  return verifier;
+}
+
+/** Highest portal role in the token, or null when it carries neither. */
+export function roleFromClaims(claims: KeycloakClaims): PortalRole | null {
+  const roles = claims.realm_access?.roles ?? [];
+  if (roles.includes("admin")) return "admin";
+  if (roles.includes("user")) return "user";
+  return null;
+}
+
+function bearerToken(request: FastifyRequest): string | null {
+  const header = request.headers.authorization;
+  if (typeof header !== "string") return null;
+  const match = /^Bearer\s+(.+)$/i.exec(header);
+  return match?.[1] ?? null;
+}
+
+function isPublic(request: FastifyRequest): boolean {
+  return PUBLIC_PATHS.has(request.url.split("?")[0] ?? "");
 }
 
 /**
- * Pre-handler for protected routes. Never touches the database on purpose —
- * route handlers own the (stub user) -> Prisma lookup so the middleware stays
- * usable in unit tests without a live portal-db.
+ * Pre-handler for protected routes. Idempotent: the global hook and the
+ * per-route preHandler both call it, the second call is a no-op.
  */
-export async function requireAuth(request: FastifyRequest, reply: FastifyReply): Promise<void> {
-  // Health check stays public (prompt.md: "except /api/health").
-  if (request.url === "/api/health" || PUBLIC_PATHS.has(request.url.split("?")[0] ?? "")) {
-    return;
+export async function requireAuth(
+  request: FastifyRequest,
+  reply: FastifyReply,
+): Promise<FastifyReply | void> {
+  if (request.user !== undefined || isPublic(request)) return;
+
+  const token = bearerToken(request);
+  if (token === null) {
+    return reply.code(401).send({ error: "unauthorized" });
   }
 
-  // Dev-only escape hatch: `x-user-id: <uuid>` lets step-5 work be tested with
-  // two different users (entitlement isolation) without Keycloak.
-  // TODO(keycloak, step 11): DELETE this header override with the stub.
-  const override = request.headers["x-user-id"];
-  if (typeof override === "string" && override.length > 0) {
-    request.log.warn("auth stub: using x-user-id override header (dev only)");
-    const stub = getStubUser();
-    request.user = { ...stub, id: override };
-    return;
+  let claims: KeycloakClaims;
+  try {
+    const { issuer, audience, jwks } = getVerifier();
+    ({ payload: claims } = await jwtVerify<KeycloakClaims>(token, jwks, { issuer, audience }));
+  } catch (err) {
+    if (err instanceof joseErrors.JOSEError) {
+      request.log.info({ code: err.code }, "auth: token rejected");
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    throw err;
   }
 
-  // TODO(keycloak, step 11): verify `Authorization: Bearer` here and 401 on
-  // missing/invalid/expired tokens. The stub accepts everything by design.
-  request.user = getStubUser();
+  if (typeof claims.sub !== "string" || typeof claims.email !== "string") {
+    return reply.code(401).send({ error: "unauthorized" });
+  }
+
+  const role = roleFromClaims(claims);
+  if (role === null) {
+    return reply.code(403).send({ error: "no_role" });
+  }
+
+  let user;
+  try {
+    user = await resolveUser(request.server.prisma, {
+      keycloakSub: claims.sub,
+      email: claims.email,
+      emailVerified: claims.email_verified === true,
+      displayName: claims.name ?? claims.preferred_username ?? claims.email,
+    });
+  } catch (err) {
+    if (err instanceof UserConflictError) {
+      return reply.code(409).send({ error: "account_conflict" });
+    }
+    throw err;
+  }
+  if (user.status !== "active") {
+    return reply.code(403).send({ error: "account_suspended" });
+  }
+
+  const authUser: AuthUser = {
+    id: user.id,
+    keycloakSub: user.keycloakSub,
+    email: user.email,
+    displayName: user.displayName,
+    role,
+  };
+  request.user = authUser;
+}
+
+/** Pre-handler for admin-only routes. Must run after requireAuth. */
+export async function requireAdmin(
+  request: FastifyRequest,
+  reply: FastifyReply,
+): Promise<FastifyReply | void> {
+  const denied = await requireAuth(request, reply);
+  if (denied !== undefined) return denied;
+  if (request.user?.role !== "admin") {
+    return reply.code(403).send({ error: "forbidden" });
+  }
 }
 
 /**
- * Registers requireAuth as a global preHandler hook scoped to /api/* paths.
+ * Registers the auth hooks globally for /api/* (and requireAdmin for
+ * /api/admin/*) as a backstop behind each route's own preHandler.
  * Wrapped in fastify-plugin so the hook also covers sibling route plugins.
  */
 async function authPluginInner(fastify: FastifyInstance): Promise<void> {
   fastify.addHook("preHandler", async (request, reply) => {
     const path = request.url.split("?")[0] ?? "";
-    if (!path.startsWith("/api/")) {
-      return;
-    }
-    await requireAuth(request, reply);
+    if (path.startsWith("/api/admin/")) return requireAdmin(request, reply);
+    if (path.startsWith("/api/")) return requireAuth(request, reply);
   });
 }
 

@@ -1,5 +1,4 @@
-import { Prisma, type PrismaClient } from "@prisma/client";
-import type { AuthUser } from "../plugins/auth-types.js";
+import type { Prisma, PrismaClient } from "@prisma/client";
 
 /**
  * Step 5 — wallet helpers over the APPEND-ONLY ledger.
@@ -41,39 +40,4 @@ export async function getBalance(db: LedgerReader, userId: string): Promise<numb
   }
   // Round to 4dp (DB precision) to avoid float dust in JSON responses.
   return Math.round((topup + refund - charge) * 10000) / 10000;
-}
-
-/**
- * The step-4 stub auth attaches a fake identity that may not exist in the DB
- * yet (fresh clone, no seed). Every write/read path calls this first so
- * endpoints work out of the box. Step 11 keeps the same call — the real JWT
- * path will upsert on keycloak_sub instead of the stub id.
- */
-export async function ensureUser(
-  db: Pick<PrismaClient, "user">,
-  user: AuthUser,
-): Promise<void> {
-  try {
-    await db.user.upsert({
-      where: { id: user.id },
-      update: {},
-      create: {
-        id: user.id,
-        keycloakSub: user.keycloakSub,
-        email: user.email,
-        displayName: user.displayName,
-      },
-    });
-  } catch (err) {
-    // Same email/keycloak_sub already registered under a different row id
-    // (e.g. reseeded DB). Fall back to the existing row instead of 500ing.
-    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
-      const existing = await db.user.findFirst({
-        where: { OR: [{ keycloakSub: user.keycloakSub }, { email: user.email }] },
-        select: { id: true },
-      });
-      if (existing !== null) return;
-    }
-    throw err;
-  }
 }

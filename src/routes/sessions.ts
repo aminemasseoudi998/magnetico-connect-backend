@@ -6,7 +6,7 @@ import {
   protocolSchema,
   sessionStatusSchema,
 } from "../plugins/swagger.js";
-import { ensureUser, getBalance } from "../services/wallet.js";
+import { getBalance } from "../services/wallet.js";
 import {
   buildGuacPayload,
   getConnectionParams,
@@ -76,7 +76,6 @@ export async function sessionRoutes(fastify: FastifyInstance): Promise<void> {
     },
     async (request, reply) => {
       const user = getAuthUser(request);
-      await ensureUser(fastify.prisma, user);
 
       const resource = await fastify.prisma.resource.findUnique({
         where: { id: request.body.resourceId },
@@ -229,7 +228,6 @@ export async function sessionRoutes(fastify: FastifyInstance): Promise<void> {
     },
     async (request) => {
       const user = getAuthUser(request);
-      await ensureUser(fastify.prisma, user);
 
       const sessions = await fastify.prisma.session.findMany({
         where: { userId: user.id },
