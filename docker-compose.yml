@@ -1,19 +1,18 @@
-# Magnetico infra — one compose file, TWO isolated Postgres databases.
+# Magnetico infra — ONE compose file for the whole platform (Keycloak,
+# Guacamole, backend, daemon; the Next.js frontend runs separately on :3000).
 #
-#   portal-db : owned by Prisma / portal-backend. Schema lives in
-#               backend/prisma/. Nothing else may write here.
-#   guac-db   : owned by Apache Guacamole. Initialized from the official
-#               initdb.sql of the guacamole image. The portal backend NEVER
-#               connects to this database (it only talks to Guacamole's REST
-#               API in step 9 via the billing daemon).
+# THREE isolated Postgres databases (separate volumes, never shared):
+#   portal-db   : Prisma / portal-backend (+ billing-daemon reads).
+#                 Schema in backend/prisma/.
+#   guac-db     : Apache Guacamole's own DB (official initdb.sql on 1st boot).
+#                 Portal code NEVER connects here (REST API only).
+#   keycloak-db : Keycloak's own DB. Nothing else touches it.
 #
-# Step 3 scope: portal-db + guac-db + guacd + guacamole.
-# Keycloak, nginx, portal-backend and billing-daemon join in steps 11/12/9 —
-# portal-backend is included below already so steps 4-5 can run locally.
+# Secrets live in infra/.env (auto-loaded, gitignored).
 #
 # Usage:
-#   docker compose up -d portal-db guac-db guacd guacamole   # step 3 only
-#   docker compose up -d --build                             # + portal-backend
+#   docker compose up -d --build     # everything
+#   docker compose up -d portal-db guac-db guacd guacamole   # data plane only
 
 name: magnetico
 
@@ -22,15 +21,15 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: magnetico
-      POSTGRES_PASSWORD: magnetico
+      POSTGRES_USER: ${PORTAL_DB_USER:-magnetico}
+      POSTGRES_PASSWORD: ${PORTAL_DB_PASSWORD:-magnetico}
       POSTGRES_DB: portal
     ports:
       - "5432:5432"
     volumes:
       - portal-db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U magnetico -d portal"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -59,6 +58,61 @@ services:
     image: guacamole/guacd:1.5.5
     restart: unless-stopped
     # No published ports — only guacamole talks to guacd (port 4822).
+
+  # Keycloak's own database, isolated from the Portal DB. Not published.
+  keycloak-db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: ${KEYCLOAK_DB_PASSWORD:-keycloak}
+    volumes:
+      - keycloak-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak -d keycloak"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Identity: realm "magnetico", brokering Google. Served under /auth so the
+  # nginx rule (/auth/* -> keycloak) needs no path rewriting.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3
+    restart: unless-stopped
+    # Turns ADMIN_EMAILS ("a@x.com, b@y.com") into the anchored regex the
+    # realm's admin-by-email mapper matches Google's `email` claim against.
+    # "." and "+" become [.] / [+] so john.smith@ can't be matched by
+    # johnXsmith@. Empty list -> a pattern no real email can match.
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        e="$${ADMIN_EMAILS,,}"; e="$${e// /}"; e="$${e//./[.]}"; e="$${e//+/[+]}"; e="$${e//,/|}"
+        export ADMIN_EMAILS_REGEX="^($${e:-no-admin-configured})$$"
+        exec /opt/keycloak/bin/kc.sh start-dev --import-realm
+    depends_on:
+      keycloak-db:
+        condition: service_healthy
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:-keycloak}
+      KC_HTTP_RELATIVE_PATH: /auth
+      KC_HEALTH_ENABLED: "true"
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USER:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      # Substituted into keycloak/keycloak/magnetico-realm.json at import time.
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:?set GOOGLE_CLIENT_ID in infra/.env}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:?set GOOGLE_CLIENT_SECRET in infra/.env}
+      PORTAL_CLIENT_SECRET: ${PORTAL_CLIENT_SECRET:?set PORTAL_CLIENT_SECRET in infra/.env}
+      PORTAL_URL: ${PORTAL_URL:-http://localhost:3000}
+      ADMIN_EMAILS: ${ADMIN_EMAILS:-}
+    ports:
+      - "8180:8080"
+    volumes:
+      - ./keycloak/keycloak/magnetico-realm.json:/opt/keycloak/data/import/magnetico-realm.json:ro
 
   guacamole:
     image: guacamole/guacamole:1.5.5
@@ -96,7 +150,7 @@ services:
       portal-db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://magnetico:magnetico@portal-db:5432/portal?schema=public
+      DATABASE_URL: postgresql://${PORTAL_DB_USER:-magnetico}:${PORTAL_DB_PASSWORD:-magnetico}@portal-db:5432/portal?schema=public
       PORT: "4000"
       STUB_USER_ID: ${STUB_USER_ID:-00000000-0000-0000-0000-000000000001}
       STUB_KEYCLOAK_SUB: ${STUB_KEYCLOAK_SUB:-stub-sub-dev-only}
@@ -110,6 +164,17 @@ services:
       # Step 7: per-connection parameters keyed by guac_connection_id.
       # Hostnames must resolve INSIDE the compose network.
       GUAC_CONNECTION_PARAMS: ${GUAC_CONNECTION_PARAMS:-{}}
+      # Step 11: Keycloak JWT verification. ISSUER must equal the token `iss`
+      # claim (browser-facing URL); the JWKS document is fetched server-side,
+      # where Keycloak answers as `keycloak:8080` on this network.
+      KEYCLOAK_ISSUER: ${KEYCLOAK_ISSUER:-http://localhost:8180/auth/realms/magnetico}
+      KEYCLOAK_JWKS_URL: ${KEYCLOAK_JWKS_URL:-http://keycloak:8080/auth/realms/magnetico/protocol/openid-connect/certs}
+      KEYCLOAK_AUDIENCE: ${KEYCLOAK_AUDIENCE:-magnetico-portal}
+      # Step 7b: Guacamole admin login used to provision per-session JDBC
+      # users (the daemon meters those; pure JSON-auth tunnels are invisible
+      # to every Guacamole observability surface).
+      GUAC_ADMIN_USER: ${GUAC_ADMIN_USER:-guacadmin}
+      GUAC_ADMIN_PASSWORD: ${GUAC_ADMIN_PASSWORD:-guacadmin}
     ports:
       - "4000:4000"
 
@@ -125,7 +190,7 @@ services:
       guacamole:
         condition: service_started
     environment:
-      DATABASE_URL: postgresql://magnetico:magnetico@portal-db:5432/portal?schema=public
+      DATABASE_URL: postgresql://${PORTAL_DB_USER:-magnetico}:${PORTAL_DB_PASSWORD:-magnetico}@portal-db:5432/portal?schema=public
       GUAC_BASE_URL: http://guacamole:8080/guacamole
       GUAC_ADMIN_USER: ${GUAC_ADMIN_USER:-guacadmin}
       GUAC_ADMIN_PASSWORD: ${GUAC_ADMIN_PASSWORD:-guacadmin}
@@ -133,6 +198,39 @@ services:
       POLL_INTERVAL_MS: ${POLL_INTERVAL_MS:-30000}
       TOKEN_GRACE_MS: ${TOKEN_GRACE_MS:-120000}
 
+  # Demo SSH target for the metered Connect flow. No published ports — only
+  # Guacamole reaches it (hostname `sshd` inside this network). Credentials
+  # come from infra/.env and are dev-only (TODO(secrets, step 14)).
+  sshd:
+    image: linuxserver/openssh-server:10.3_p1-r1-ls237
+    restart: unless-stopped
+    environment:
+      USER_NAME: ${SSH_USER:-ops}
+      USER_PASSWORD: ${SSH_PASSWORD:?Set SSH_PASSWORD in infra/.env}
+      PASSWORD_ACCESS: "true"
+      SUDO_ACCESS: "false"
+    volumes:
+      - sshd-config:/config
+
+  # Step 12: single entrypoint for the whole platform. Host port 8000
+  # (:80 is taken by System, :8080 by Jenkins on dev machines).
+  # Frontend runs outside compose (prompt spec) on host :3000.
+  reverse-proxy:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - portal-backend
+      - guacamole
+      - keycloak
+    ports:
+      - "8000:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
 volumes:
   portal-db-data:
   guac-db-data:
+  keycloak-db-data:
+  sshd-config:

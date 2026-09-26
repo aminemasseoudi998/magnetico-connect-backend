@@ -1,0 +1,3 @@
+# Local dev secrets — NEVER commit (auto-loaded by `docker compose` from this dir).
+.env
+*.log
