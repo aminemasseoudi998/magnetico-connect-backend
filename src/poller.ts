@@ -12,6 +12,7 @@ import { decideKills, type LiveSession } from "./enforcer.js";
 import { accruedFor } from "./metering.js";
 import {
   GuacError,
+  deleteGuacUser,
   killActiveConnections,
   listActiveConnections,
   listConnectionHistory,
@@ -221,6 +222,14 @@ export async function tick(): Promise<TickSummary> {
           `charge=${plan.finalCharge} hold=${plan.session.hold_amount} ` +
           `history=${plan.historyRef ?? "none"}`,
       );
+      // Drop the per-session JDBC user (provisioned by POST /api/sessions).
+      // Best-effort: a failed delete must not fail the tick, and the next
+      // provision recreates on conflict anyway.
+      try {
+        await deleteGuacUser(config.guacBaseUrl, token, config.dataSources[0] as string, plan.session.id);
+      } catch (err) {
+        fail(`cleanup-user/${plan.session.id}`, err);
+      }
     } catch (err) {
       fail(`reconcile/${plan.session.id}`, err);
     }

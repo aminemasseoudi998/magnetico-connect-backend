@@ -95,8 +95,7 @@ export async function killActiveConnections(
 }
 
 /** Full connection-history list; callers filter by username/connection. */
-export async function listConnectionHistory(
-  baseUrl: string,
+export async function listConnectionHistory(  baseUrl: string,
   token: string,
   dataSource: string,
 ): Promise<GuacHistoryEntry[]> {
@@ -116,4 +115,25 @@ export async function listConnectionHistory(
     body = [];
   }
   return Array.isArray(body) ? (body as GuacHistoryEntry[]) : [];
+}
+
+/**
+ * Delete a per-session JDBC user (provisioned by POST /api/sessions, named =
+ * portal session id). Best-effort: 404 (already gone) is fine, anything else
+ * throws for the caller to log. Called after a session reconciles so Guacamole
+ * never accumulates stale session accounts.
+ */
+export async function deleteGuacUser(
+  baseUrl: string,
+  token: string,
+  dataSource: string,
+  username: string,
+): Promise<void> {
+  const res = await fetch(
+    `${baseUrl}/api/session/data/${encodeURIComponent(dataSource)}/users/${encodeURIComponent(username)}`,
+    { method: "DELETE", headers: authed(token) },
+  );
+  if (!res.ok && res.status !== 404) {
+    throw new GuacError(res.status, `Guacamole delete user failed (${res.status})`);
+  }
 }
