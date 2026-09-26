@@ -3,7 +3,7 @@
 Node.js + TypeScript API for the Magnetico metered-access portal.
 **Fastify** for HTTP, **Prisma ORM** against the **Portal Postgres** — the only
 database this service ever touches. Guacamole keeps its own isolated Postgres;
-the backend talks to Guacamole solely through signed JSON-auth tokens
+the backend provisions per-session Guacamole users through the admin REST
 (`POST /api/sessions`) and never connects to its DB.
 
 Auth is **Keycloak** (realm `magnetico`, brokering Google): every `/api/*`
@@ -68,10 +68,13 @@ Production-ish local run: `npm run build && npm start`.
 | `LOG_LEVEL` | no | `info` | Fastify log level. |
 | `KEYCLOAK_ISSUER` | yes | — | Realm issuer, e.g. `http://localhost:8180/auth/realms/magnetico`. Must match the token `iss` exactly (same host the frontend uses). |
 | `KEYCLOAK_AUDIENCE` | no | `magnetico-portal` | Required `aud` in access tokens (audience mapper in the realm import). |
+| `KEYCLOAK_JWKS_URL` | no | `<issuer>/protocol/openid-connect/certs` | Override when the issuer host is unreachable from the backend itself — inside compose, Keycloak answers as `http://keycloak:8080/...`. Without it, every authenticated call 500s. |
 | `GUAC_BASE_URL` | no | `http://localhost:8085/guacamole` | Guacamole base used to build `guacUrl`. Must match Guacamole's **published host port** (`8085:8080` in compose). |
 | `HOLD_MINUTES_DEFAULT` | no | `60` | Hold window (`rate × minutes`, capped by balance) when an entitlement sets no `max_session_min`. |
 | `GUAC_JSON_AUTH_SECRET` | no | — (stub tokens) | 128-bit key as 32 hex digits. Must equal Guacamole's `JSON_SECRET_KEY`. Generate: `node -e "console.log(require('crypto').randomBytes(16).toString('hex'))"`. |
 | `GUAC_CONNECTION_PARAMS` | iff secret set | `{}` | JSON map `guac_connection_id → {hostname, port, …}`. Hostnames must resolve **from the Guacamole container**. Missing entry → `POST /api/sessions` 500s (`connection_unconfigured`). |
+| `GUAC_ADMIN_USER` / `GUAC_ADMIN_PASSWORD` | no | `guacadmin` / `guacadmin` | Guacamole admin login for per-session provisioning (JDBC user create/grant/login, connection ensure). |
+| `GUAC_DATA_SOURCE` | no | `postgresql` | JDBC data source id for the admin REST calls. |
 
 ## Scripts
 
@@ -95,7 +98,7 @@ docs: **`GET /docs`** (Swagger UI, spec at `/docs/json`).
 | `GET` | `/api/health` | Public liveness probe. |
 | `GET` | `/api/me` | Current user + portal role (`admin` \| `user`). |
 | `GET` | `/api/resources` | Entitled, active resources for the user. |
-| `POST` | `/api/sessions` `{resourceId}` | Entitlement + balance check → `pending` session + `hold` → `{sessionId, guacToken, guacUrl}`. Errors: `404` unknown, `403` inactive/no-entitlement, `402` insufficient, `500` token misconfiguration. |
+| `POST` | `/api/sessions` `{resourceId}` | Entitlement + balance check → `pending` session + `hold` → provisions a per-session Guacamole user → `{sessionId, guacUrl}` (`guacToken` only in stub mode). Errors: `404` unknown, `403` inactive/no-entitlement, `402` insufficient, `500` provisioning misconfiguration. |
 | `GET` | `/api/sessions/history` | Past sessions with resource + `finalCharge` (`?limit`, 1–200). |
 | `GET` | `/api/wallet/balance` | Derived balance: `SUM(topup)+SUM(refund)−SUM(charge)`; holds excluded. |
 | `POST` | `/api/wallet/topup` `{amount}` | Appends a `topup` leg (stub credit — real PSP later). |

@@ -1,4 +1,5 @@
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
+import { randomUUID } from "node:crypto";
 import { requireAuth } from "../plugins/auth.js";
 import { getAuthUser } from "../plugins/auth-types.js";
 import {
@@ -8,11 +9,20 @@ import {
 } from "../plugins/swagger.js";
 import { getBalance } from "../services/wallet.js";
 import {
-  buildGuacPayload,
+  clientUrl,
+  deleteUser,
+  ensureConnection,
+  ensureSessionUser,
+  grantConnection,
+  guacAdminConfig,
+  guacAdminLogin,
+  GuacAdminError,
+  loginAs,
+  randomPassword,
+} from "../services/guac-admin.js";
+import {
   getConnectionParams,
   getGuacUrl,
-  getJsonSecretKey,
-  signGuacToken,
   signGuacTokenStub,
 } from "../services/guac-token.js";
 
@@ -23,23 +33,109 @@ import {
  * `max_session_min` narrows it further when set.
  * TODO(tariffs): confirm the default hold window with the real tariff table.
  */
+import type { PrismaClient } from "@prisma/client";
+
 const DEFAULT_HOLD_MINUTES = Number(process.env["HOLD_MINUTES_DEFAULT"] ?? 60);
 
-class InsufficientBalanceError extends Error {
-  balance: number;
-  constructor(balance: number) {
-    super("insufficient balance");
-    this.balance = balance;
+type Provision =
+  | { stub: true }
+  | { guacUrl: string }
+  | { error: "guac_provision_failed" | "connection_unconfigured"; detail: string };
+
+function messageOf(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** node-fetch errors (ECONNREFUSED etc.) surface as TypeError: fetch failed. */
+function isUnreachable(err: unknown): boolean {
+  return err instanceof TypeError;
+}
+
+/**
+ * Provision the Guacamole side of a session: ensure the JDBC connection,
+ * create a throwaway user named = session id, grant it that one connection,
+ * log in as it. Returns the browser handoff URL, a stub fallback, or a
+ * 500-class error descriptor (never throws for expected failures).
+ */
+async function provisionGuacamole(
+  request: FastifyRequest,
+  prisma: PrismaClient,
+  resource: { id: string; name: string; protocol: "ssh" | "rdp"; guacConnectionId: string },
+  sessionId: string,
+): Promise<Provision> {
+  const cfg = guacAdminConfig();
+  let adminToken: string;
+  try {
+    adminToken = await guacAdminLogin(cfg);
+  } catch (err) {
+    if (isUnreachable(err)) {
+      request.log.warn("sessions: Guacamole unreachable — stub token (dev only)");
+      return { stub: true };
+    }
+    return { error: "guac_provision_failed", detail: messageOf(err) };
+  }
+
+  let parameters: Record<string, string>;
+  try {
+    parameters = getConnectionParams(resource.guacConnectionId);
+  } catch (err) {
+    return { error: "connection_unconfigured", detail: messageOf(err) };
+  }
+
+  const sessionPassword = randomPassword();
+  try {
+    const connectionId = await ensureConnection(cfg, adminToken, {
+      name: resource.name,
+      protocol: resource.protocol,
+      parameters,
+    });
+    if (connectionId !== resource.guacConnectionId) {
+      await prisma.resource.update({
+        where: { id: resource.id },
+        data: { guacConnectionId: connectionId },
+      });
+    }
+    await ensureSessionUser(cfg, adminToken, sessionId, sessionPassword);
+    await grantConnection(cfg, adminToken, sessionId, connectionId);
+    const authToken = await loginAs(cfg, sessionId, sessionPassword);
+    return { guacUrl: clientUrl(cfg, connectionId, authToken) };
+  } catch (err) {
+    await deleteUser(cfg, adminToken, sessionId).catch(() => undefined);
+    if (isUnreachable(err)) {
+      request.log.warn("sessions: Guacamole unreachable mid-provision — stub token (dev only)");
+      return { stub: true };
+    }
+    return { error: "guac_provision_failed", detail: messageOf(err) };
+  }
+}
+
+/** Remove a provisioned session user when the portal write fails afterwards. */
+async function provisionedCleanup(request: FastifyRequest, sessionId: string): Promise<void> {
+  try {
+    const cfg = guacAdminConfig();
+    const adminToken = await guacAdminLogin(cfg);
+    await deleteUser(cfg, adminToken, sessionId);
+  } catch (err) {
+    request.log.warn({ err }, "sessions: orphan Guacamole user cleanup failed");
   }
 }
 
 export async function sessionRoutes(fastify: FastifyInstance): Promise<void> {
   /**
-   * 2. POST /api/sessions { resourceId } — entitlement + balance check, insert
-   * session (pending), write a 'hold' ledger entry, return a Guacamole token.
-   * The token is a real AES JSON-auth token when GUAC_JSON_AUTH_SECRET is set
-   * (step 7); without the secret it falls back to the dev stub so endpoint
-   * work doesn't block on a Guacamole stack.
+   * 2. POST /api/sessions { resourceId } — entitlement + balance check, reserve
+   * a hold, provision the session in Guacamole, return the client handoff.
+   *
+   * Provisioning (step 7b): the JDBC connection is ensured by resource name,
+   * a throwaway JDBC user named = session id is created with a fresh random
+   * password, granted READ on that one connection, and logged in server-side;
+   * the returned `guacUrl` carries the resulting auth token (`?token=`), so
+   * the browser never touches Guacamole credentials or CORS. JDBC-backed
+   * tunnels are visible to the admin REST, which is what the billing daemon
+   * meters (pure JSON-auth tunnels are invisible to every Guacamole
+   * observability surface — verified live, see services/guac-token.ts).
+   *
+   * Without GUAC_JSON_AUTH_SECRET the endpoint falls back to the dev stub so
+   * endpoint work doesn't block on a Guacamole stack.
    */
   fastify.post<{ Body: { resourceId: string } }>(
     "/api/sessions",
@@ -49,8 +145,9 @@ export async function sessionRoutes(fastify: FastifyInstance): Promise<void> {
         tags: ["sessions"],
         summary: "Open a metered session",
         description:
-          "Checks entitlement + balance, inserts a pending session, writes a hold. " +
-          "Returns a Guacamole JSON-auth token (real when GUAC_JSON_AUTH_SECRET is set, stub otherwise).",
+          "Checks entitlement + balance, reserves a hold, provisions a " +
+          "per-session Guacamole user, and returns the client handoff URL " +
+          "(stub token when GUAC_JSON_AUTH_SECRET is unset).",
         body: {
           type: "object",
           required: ["resourceId"],
@@ -60,11 +157,11 @@ export async function sessionRoutes(fastify: FastifyInstance): Promise<void> {
         response: {
           201: {
             type: "object",
-            required: ["sessionId", "guacToken", "guacUrl"],
+            required: ["sessionId", "guacUrl"],
             properties: {
               sessionId: { type: "string" },
-              guacToken: { type: "string" },
               guacUrl: { type: "string" },
+              guacToken: { type: "string" },
             },
           },
           400: errorResponseSchema,
@@ -94,76 +191,80 @@ export async function sessionRoutes(fastify: FastifyInstance): Promise<void> {
         return reply.code(403).send({ error: "no_entitlement" });
       }
 
-      // NOTE(race, step 14): check-then-write inside one interactive transaction
-      // narrows but does not eliminate double-spend under concurrency. The
-      // billing daemon (step 9) reconciles against actual usage; a serializable
-      // hold with row locking is hardening work, not PoC work.
+      // Balance is read before provisioning so a broke request never creates
+      // Guacamole accounts. NOTE(race, step 14): check-then-write is not
+      // serializable; the billing daemon reconciles against actual usage.
+      const balance = await getBalance(fastify.prisma, user.id);
+      const holdMinutes = entitlement.maxSessionMin ?? DEFAULT_HOLD_MINUTES;
+      const rate = Number(resource.ratePerMinute);
+      const holdAmount = Math.round(Math.min(balance, rate * holdMinutes) * 10000) / 10000;
+      if (!Number.isFinite(holdAmount) || holdAmount <= 0) {
+        return reply.code(402).send({ error: "insufficient_balance", balance });
+      }
+
+      // Session id doubles as the Guacamole username (step-7 correlation for
+      // the billing daemon), so it is minted before anything is persisted.
+      const sessionId = randomUUID();
+
+      // Provision Guacamole. Unreachable stack in dev -> stub fallback (same
+      // shape as the secret-unset path); real misconfiguration -> 500.
+      let guacUrl: string;
+      let stubToken: string | undefined;
+      if (process.env["GUAC_JSON_AUTH_SECRET"] === undefined) {
+        request.log.warn("sessions: GUAC_JSON_AUTH_SECRET unset — returning stub token (dev only)");
+        stubToken = signGuacTokenStub({
+          connectionId: resource.guacConnectionId,
+          userId: user.id,
+          sessionId,
+        });
+        guacUrl = getGuacUrl(resource.guacConnectionId, stubToken);
+      } else {
+        const provision = await provisionGuacamole(request, fastify.prisma, resource, sessionId);
+        if ("stub" in provision) {
+          stubToken = signGuacTokenStub({
+            connectionId: resource.guacConnectionId,
+            userId: user.id,
+            sessionId,
+          });
+          guacUrl = getGuacUrl(resource.guacConnectionId, stubToken);
+        } else if ("error" in provision) {
+          return reply.code(500).send({ error: provision.error, detail: provision.detail });
+        } else {
+          guacUrl = provision.guacUrl;
+        }
+      }
+
       try {
-        const { session } = await fastify.prisma.$transaction(async (tx) => {
-          const balance = await getBalance(tx, user.id);
-          const holdMinutes = entitlement.maxSessionMin ?? DEFAULT_HOLD_MINUTES;
-          const rate = Number(resource.ratePerMinute);
-          const holdAmount =
-            Math.round(Math.min(balance, rate * holdMinutes) * 10000) / 10000;
-          if (!Number.isFinite(holdAmount) || holdAmount <= 0) {
-            throw new InsufficientBalanceError(balance);
-          }
-          const created = await tx.session.create({
+        await fastify.prisma.$transaction([
+          fastify.prisma.session.create({
             data: {
+              id: sessionId,
               userId: user.id,
               resourceId: resource.id,
               holdAmount: holdAmount.toFixed(4),
               status: "pending",
             },
-          });
-          await tx.ledgerEntry.create({
+          }),
+          fastify.prisma.ledgerEntry.create({
             data: {
               userId: user.id,
-              sessionId: created.id,
+              sessionId,
               type: "hold",
               amount: holdAmount.toFixed(4),
             },
-          });
-          return { session: created, balance };
-        });
-
-        let guacToken: string;
-        if (process.env["GUAC_JSON_AUTH_SECRET"] === undefined) {
-          request.log.warn("sessions: GUAC_JSON_AUTH_SECRET unset — returning stub token (dev only)");
-          guacToken = signGuacTokenStub({
-            connectionId: resource.guacConnectionId,
-            userId: user.id,
-            sessionId: session.id,
-          });
-        } else {
-          try {
-            const payload = buildGuacPayload({
-              sessionId: session.id,
-              connectionName: resource.guacConnectionId,
-              protocol: resource.protocol,
-              parameters: getConnectionParams(resource.guacConnectionId),
-            });
-            guacToken = signGuacToken(payload, getJsonSecretKey());
-          } catch (err) {
-            request.log.error({ err }, "sessions: Guacamole token signing failed");
-            return reply
-              .code(500)
-              .send({ error: "guac_token_failed", detail: (err as Error).message });
-          }
-        }
-        return reply.code(201).send({
-          sessionId: session.id,
-          guacToken,
-          guacUrl: getGuacUrl(resource.guacConnectionId, guacToken),
-        });
+          }),
+        ]);
       } catch (err) {
-        if (err instanceof InsufficientBalanceError) {
-          return reply
-            .code(402)
-            .send({ error: "insufficient_balance", balance: err.balance });
-        }
+        // A provisioned Guacamole user with no portal session must not linger.
+        await provisionedCleanup(request, sessionId).catch(() => undefined);
         throw err;
       }
+
+      return reply.code(201).send(
+        stubToken === undefined
+          ? { sessionId, guacUrl }
+          : { sessionId, guacUrl, guacToken: stubToken },
+      );
     },
   );
 

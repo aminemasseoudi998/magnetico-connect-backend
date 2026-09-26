@@ -2,11 +2,13 @@
 // without requiring shell exports. Shell variables still win over the file.
 import "dotenv/config";
 
+import { STATUS_CODES } from "node:http";
+
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import swagger from "@fastify/swagger";
 import swaggerUi from "@fastify/swagger-ui";
-import { authPlugin } from "./plugins/auth.js";
+import { AuthError, authPlugin } from "./plugins/auth.js";
 import { prismaPlugin } from "./plugins/prisma.js";
 import { openapiOptions, swaggerUiOptions } from "./plugins/swagger.js";
 import { adminRoutes } from "./routes/admin.js";
@@ -17,6 +19,28 @@ import { walletRoutes } from "./routes/wallet.js";
 
 export function buildServer() {
   const fastify = Fastify({ logger: { level: process.env["LOG_LEVEL"] ?? "info" } });
+
+  // Single send site for auth denials. Guards throw AuthError (which unwinds
+  // hooks + handler alike); anything else keeps Fastify's default error
+  // shape, replicated here because a custom handler replaces the default.
+  fastify.setErrorHandler((error, _request, reply) => {
+    if (error instanceof AuthError) {
+      if (!reply.sent) {
+        void reply.code(error.status).send({ error: error.code });
+      }
+      return;
+    }
+    const rawStatus = (error as { statusCode?: unknown }).statusCode;
+    const status = typeof rawStatus === "number" && rawStatus >= 400 ? rawStatus : 500;
+    fastify.log.error({ err: error }, "unhandled error");
+    if (!reply.sent) {
+      void reply.code(status).send({
+        statusCode: status,
+        error: STATUS_CODES[status] ?? "Internal Server Error",
+        message: (error as Error).message,
+      });
+    }
+  });
 
   void fastify.register(cors, { origin: true });
   void fastify.register(prismaPlugin);

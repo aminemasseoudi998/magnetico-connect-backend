@@ -1,4 +1,4 @@
-import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
 import fp from "fastify-plugin";
 import { createRemoteJWKSet, errors as joseErrors, jwtVerify, type JWTPayload } from "jose";
 import type { AuthUser, PortalRole } from "./auth-types.js";
@@ -53,10 +53,16 @@ function getVerifier(): Verifier {
       "KEYCLOAK_ISSUER is not set (e.g. http://localhost:8180/auth/realms/magnetico)",
     );
   }
+  // The issuer must match the token `iss` claim exactly (browser-facing URL),
+  // but the JWKS document is fetched server-side — from inside Docker that
+  // host:port usually resolves differently, so the certs URL is overridable.
+  // Compose default: http://keycloak:8080/auth/realms/magnetico/protocol/openid-connect/certs
+  const jwksUrl =
+    process.env["KEYCLOAK_JWKS_URL"] ?? `${issuer}/protocol/openid-connect/certs`;
   verifier = {
     issuer,
     audience: process.env["KEYCLOAK_AUDIENCE"] ?? "magnetico-portal",
-    jwks: createRemoteJWKSet(new URL(`${issuer}/protocol/openid-connect/certs`)),
+    jwks: createRemoteJWKSet(new URL(jwksUrl)),
   };
   return verifier;
 }
@@ -88,15 +94,34 @@ function isPublic(request: FastifyRequest): boolean {
  * Pre-handler for protected routes. Idempotent: the global hook and the
  * per-route preHandler both call it, the second call is a no-op.
  */
-export async function requireAuth(
-  request: FastifyRequest,
-  reply: FastifyReply,
-): Promise<FastifyReply | void> {
+/**
+ * NOTE (FST_ERR_REP_ALREADY_SENT post-mortem): denial used to work by
+ * `return reply.code(...).send(...)` with callers branching on
+ * `denied !== undefined`. That broke in production: the awaited denial
+ * resolved `undefined` despite the send having happened (verified with
+ * request-scoped debug logging — single execution, `sent=true`, result
+ * `undefined`), so execution fell through to a second send. Whatever the
+ * underlying cause (send-result / await interaction in this Fastify
+ * version), the lesson is structural: denial MUST unwind, never return.
+ * Guards below throw AuthError; a single setErrorHandler in server.ts turns
+ * those into responses. There is exactly one send site for auth failures.
+ */
+export class AuthError extends Error {
+  status: number;
+  code: string;
+  constructor(status: number, code: string) {
+    super(code);
+    this.status = status;
+    this.code = code;
+  }
+}
+
+export async function requireAuth(request: FastifyRequest): Promise<void> {
   if (request.user !== undefined || isPublic(request)) return;
 
   const token = bearerToken(request);
   if (token === null) {
-    return reply.code(401).send({ error: "unauthorized" });
+    throw new AuthError(401, "unauthorized");
   }
 
   let claims: KeycloakClaims;
@@ -106,18 +131,18 @@ export async function requireAuth(
   } catch (err) {
     if (err instanceof joseErrors.JOSEError) {
       request.log.info({ code: err.code }, "auth: token rejected");
-      return reply.code(401).send({ error: "unauthorized" });
+      throw new AuthError(401, "unauthorized");
     }
     throw err;
   }
 
   if (typeof claims.sub !== "string" || typeof claims.email !== "string") {
-    return reply.code(401).send({ error: "unauthorized" });
+    throw new AuthError(401, "unauthorized");
   }
 
   const seedRole = seedRoleFromClaims(claims);
   if (seedRole === null) {
-    return reply.code(403).send({ error: "no_role" });
+    throw new AuthError(403, "no_role");
   }
 
   let user;
@@ -131,12 +156,12 @@ export async function requireAuth(
     });
   } catch (err) {
     if (err instanceof UserConflictError) {
-      return reply.code(409).send({ error: "account_conflict" });
+      throw new AuthError(409, "account_conflict");
     }
     throw err;
   }
   if (user.status !== "active") {
-    return reply.code(403).send({ error: "account_suspended" });
+    throw new AuthError(403, "account_suspended");
   }
 
   const authUser: AuthUser = {
@@ -151,14 +176,10 @@ export async function requireAuth(
 }
 
 /** Pre-handler for admin-only routes. Must run after requireAuth. */
-export async function requireAdmin(
-  request: FastifyRequest,
-  reply: FastifyReply,
-): Promise<FastifyReply | void> {
-  const denied = await requireAuth(request, reply);
-  if (denied !== undefined) return denied;
+export async function requireAdmin(request: FastifyRequest): Promise<void> {
+  await requireAuth(request);
   if (request.user?.role !== "admin") {
-    return reply.code(403).send({ error: "forbidden" });
+    throw new AuthError(403, "forbidden");
   }
 }
 
@@ -168,10 +189,10 @@ export async function requireAdmin(
  * Wrapped in fastify-plugin so the hook also covers sibling route plugins.
  */
 async function authPluginInner(fastify: FastifyInstance): Promise<void> {
-  fastify.addHook("preHandler", async (request, reply) => {
+  fastify.addHook("preHandler", async (request) => {
     const path = request.url.split("?")[0] ?? "";
-    if (path.startsWith("/api/admin/")) return requireAdmin(request, reply);
-    if (path.startsWith("/api/")) return requireAuth(request, reply);
+    if (path.startsWith("/api/admin/")) return requireAdmin(request);
+    if (path.startsWith("/api/")) return requireAuth(request);
   });
 }
 
