@@ -1,5 +1,5 @@
 // Portal Postgres schema — the ONLY database this backend touches.
-// Guacamole keeps its own separate Postgres (see infra/docker-compose.yml).
+// Guacamole has its own database; servers are mirrored there by the backend.
 // Ledger rule (app-enforced): ledger_entries is APPEND-ONLY — the backend
 // must never update/delete rows here; balance is always derived via SUM.
 
@@ -23,13 +23,12 @@ enum UserStatus {
   deleted
 }
 
-// Portal role. Seeded from the Keycloak realm role at first sign-in, then
-// owned by this table: the admin console edits it and the token no longer
-// overrides it (see plugins/auth.ts).
+// Portal role — a copy of the Keycloak realm role, refreshed on every
+// authenticated request (see plugins/auth.ts). Keycloak is the source of
+// truth: grant or remove `admin` there, never here.
 enum UserRole {
   admin
-  engineer
-  analyst
+  user
 }
 
 enum SessionStatus {
@@ -53,7 +52,7 @@ model User {
   email       String     @unique
   displayName String     @map("display_name")
   status      UserStatus @default(active)
-  role        UserRole   @default(engineer)
+  role        UserRole   @default(user)
   // Free-form org unit shown in the admin console. Null until an admin sets it.
   team        String?
   createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
@@ -66,14 +65,43 @@ model User {
 }
 
 model Resource {
-  id               String   @id @default(uuid()) @db.Uuid
-  name             String   @unique
+  id               String    @id @default(uuid()) @db.Uuid
+  // Display name shown to users ("Build box", "Finance RDP").
+  name             String    @unique
+  description      String?
   protocol         Protocol
   tier             String
-  guacConnectionId String   @map("guac_connection_id")
+  // Target as guacd reaches it (IP or DNS name). Never sent to non-admins.
+  hostname         String
+  port             Int
+  username         String?
+  // AES-256-GCM ciphertexts (services/secrets.ts), bound to this row's id.
+  // Write-only through the API: responses only say whether one is set.
+  passwordEnc      String?   @map("password_enc")
+  privateKeyEnc    String?   @map("private_key_enc")
+  passphraseEnc    String?   @map("passphrase_enc")
+  // Non-secret protocol + policy options, validated by services/servers.ts.
+  settings         Json      @default("{}")
   // Magneticoin burned per minute of connected time.
-  ratePerMinute    Decimal  @map("rate_per_minute") @db.Decimal(12, 4)
-  active           Boolean  @default(true)
+  ratePerMinute    Decimal   @map("rate_per_minute") @db.Decimal(12, 4)
+  // Cap on a single session for this server, in minutes (null = no cap).
+  maxSessionMin    Int?      @map("max_session_min")
+  // true = every user may connect; false = only users with an entitlement.
+  openToAll        Boolean   @default(false) @map("open_to_all")
+  // false = "drained": hidden from users, no new sessions, live ones continue.
+  active           Boolean   @default(true)
+  // Identifier of the mirrored connection in Guacamole's database (group
+  // "Magnetico"). Null until the first successful sync (services/guacamole.ts).
+  guacConnectionId String?   @map("guac_connection_id")
+  // Hash of the Guacamole connection as last synced (name, protocol,
+  // parameters). Tells which side changed since: Guacamole or the portal.
+  guacFingerprint  String?   @map("guac_fingerprint")
+  // Created from a connection an admin added in Guacamole (two-way sync).
+  guacImported     Boolean   @default(false) @map("guac_imported")
+  // Set when a server with session history is deleted (rows are kept for billing).
+  archivedAt       DateTime? @map("archived_at") @db.Timestamptz(6)
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   entitlements Entitlement[]
   sessions     Session[]
@@ -105,18 +133,29 @@ model Session {
   id             String        @id @default(uuid()) @db.Uuid
   userId         String        @map("user_id") @db.Uuid
   resourceId     String        @map("resource_id") @db.Uuid
-  // Amount reserved at creation; the billing daemon draws the real charge from it.
+  // Amount reserved at creation — the most this session can ever be charged.
   holdAmount     Decimal       @map("hold_amount") @db.Decimal(12, 4)
+  // Rate locked in when the session opened; admin rate changes never touch
+  // a running session. Null on sessions from before per-session rates.
+  ratePerMinute  Decimal?      @map("rate_per_minute") @db.Decimal(12, 4)
   status         SessionStatus @default(pending)
   // Pointer into guacamole_connection_history, filled by the reconciler (step 9).
   guacHistoryRef String?       @map("guac_history_ref")
+  // Why the session ended: user_closed | balance_exhausted | time_limit |
+  // admin_terminated | server_closed | connection_failed | never_connected |
+  // interrupted (see services/live-sessions.ts).
+  endReason      String?       @map("end_reason")
+  // The server had session recording on when this session opened.
+  recorded       Boolean       @default(false)
+  // Heartbeat while the tunnel is open; bills an interrupted session fairly.
+  lastSeenAt     DateTime?     @map("last_seen_at") @db.Timestamptz(6)
   startedAt      DateTime?     @map("started_at") @db.Timestamptz(6)
   endedAt        DateTime?     @map("ended_at") @db.Timestamptz(6)
   finalCharge    Decimal?      @map("final_charge") @db.Decimal(12, 4)
   createdAt      DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  resource Resource @relation(fields: [resourceId], references: [id], onDelete: Restrict)
+  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  resource Resource      @relation(fields: [resourceId], references: [id], onDelete: Restrict)
   ledger   LedgerEntry[]
 
   @@index([userId, status])
@@ -141,4 +180,35 @@ model LedgerEntry {
   @@index([userId, createdAt])
   @@index([sessionId])
   @@map("ledger_entries")
+}
+
+enum AuditSeverity {
+  info
+  warn
+  crit
+}
+
+// Who did what, when — admin actions, the Guacamole sync, role changes coming
+// from Keycloak. APPEND-ONLY by convention (services/audit.ts only inserts).
+// Actor and target are stored as copies (email, label), not foreign keys, so
+// the trail survives users and servers being deleted.
+model AuditEvent {
+  id          String        @id @default(uuid()) @db.Uuid
+  at          DateTime      @default(now()) @db.Timestamptz(6)
+  // Portal user who acted; null for the system (Guacamole sync, Keycloak).
+  actorId     String?       @map("actor_id") @db.Uuid
+  actorLabel  String        @map("actor_label")
+  // Dotted key, e.g. "server.created", "session.terminated".
+  action      String
+  severity    AuditSeverity @default(info)
+  // server | session | user | system
+  targetType  String        @map("target_type")
+  targetId    String?       @map("target_id")
+  targetLabel String        @map("target_label")
+  // What changed. Never contains secrets.
+  details     Json          @default("{}")
+
+  @@index([at])
+  @@index([targetType, targetId])
+  @@map("audit_events")
 }

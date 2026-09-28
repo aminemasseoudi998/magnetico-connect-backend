@@ -47,13 +47,44 @@ export const swaggerUiOptions: FastifySwaggerUiOptions = {
   uiConfig: { docExpansion: "list", deepLinking: true },
 };
 
-/** Shared shape for { error } responses (402 adds `balance`). */
+/** Shared shape for { error } responses (402 adds `balance`, 409 may add `sessionId`). */
 export const errorResponseSchema = {
   type: "object",
   required: ["error"],
   properties: {
     error: { type: "string" },
     balance: { type: "number" },
+    sessionId: { type: "string" },
+  },
+} as const;
+
+const healthSampleSchema = {
+  type: "object",
+  properties: {
+    at: { type: "number" },
+    cpuPct: { type: ["number", "null"] },
+    load1: { type: ["number", "null"] },
+    cores: { type: ["number", "null"] },
+    memUsed: { type: ["number", "null"] },
+    memTotal: { type: ["number", "null"] },
+    memUsedPct: { type: ["number", "null"] },
+    diskUsed: { type: ["number", "null"] },
+    diskTotal: { type: ["number", "null"] },
+    diskUsedPct: { type: ["number", "null"] },
+    netRxBps: { type: ["number", "null"] },
+    netTxBps: { type: ["number", "null"] },
+    uptimeSec: { type: ["number", "null"] },
+  },
+} as const;
+
+export const healthViewSchema = {
+  type: "object",
+  required: ["mode", "samples", "latest", "lastError"],
+  properties: {
+    mode: { type: "string", enum: ["off", "ssh", "exporter"] },
+    samples: { type: "array", items: healthSampleSchema },
+    latest: { anyOf: [healthSampleSchema, { type: "null" }] },
+    lastError: { type: ["string", "null"] },
   },
 } as const;
 
@@ -64,10 +95,10 @@ export const ledgerTypeSchema = {
   enum: ["topup", "hold", "charge", "refund"],
 } as const;
 
-/** Portal role stored on `users.role`. */
+/** Portal role — mirrors the Keycloak realm role (read-only in the API). */
 export const operatorRoleSchema = {
   type: "string",
-  enum: ["admin", "engineer", "analyst"],
+  enum: ["admin", "user"],
 } as const;
 
 /** Account states an admin can set (`deleted` is not reachable from the UI). */

@@ -8,6 +8,8 @@ import {
   protocolSchema,
   sessionStatusSchema,
 } from "../plugins/swagger.js";
+import { audit } from "../services/audit.js";
+import { endSession } from "../services/live-sessions.js";
 import {
   countOperators,
   getOperator,
@@ -177,14 +179,16 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
   );
 
   /**
-   * PATCH /api/admin/operators/:id — role, team and status.
+   * PATCH /api/admin/operators/:id — team and status.
    *
-   * An admin cannot demote or suspend themselves: locking the last admin out
-   * of the console is not a recoverable mistake from inside the product.
+   * Roles are not editable here: they belong to Keycloak and are copied onto
+   * the row at every request, so an edit made here would be overwritten.
+   * An admin cannot suspend themselves: locking the last admin out of the
+   * console is not a recoverable mistake from inside the product.
    */
   fastify.patch<{
     Params: { id: string };
-    Body: { role?: "admin" | "engineer" | "analyst"; team?: string | null; status?: "active" | "suspended" };
+    Body: { team?: string | null; status?: "active" | "suspended" };
   }>(
     "/api/admin/operators/:id",
     {
@@ -193,8 +197,8 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
         tags: ["admin"],
         summary: "Update an operator",
         description:
-          "Changes role, team and/or status. Refuses self-demotion and self-suspension " +
-          "(403 cannot_modify_self).",
+          "Changes team and/or status (roles are managed in Keycloak). Refuses " +
+          "self-suspension (403 cannot_modify_self).",
         params: {
           type: "object",
           required: ["id"],
@@ -205,7 +209,6 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
           additionalProperties: false,
           minProperties: 1,
           properties: {
-            role: operatorRoleSchema,
             team: { type: ["string", "null"], maxLength: MAX_TEAM_LENGTH },
             status: operatorStatusSchema,
           },
@@ -224,9 +227,9 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
     async (request, reply) => {
       const actor = getAuthUser(request);
       const { id } = request.params;
-      const { role, team, status } = request.body;
+      const { team, status } = request.body;
 
-      if (id === actor.id && ((role !== undefined && role !== "admin") || status === "suspended")) {
+      if (id === actor.id && status === "suspended") {
         return reply.code(403).send({ error: "cannot_modify_self" });
       }
 
@@ -238,12 +241,43 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
       await fastify.prisma.user.update({
         where: { id },
         data: {
-          ...(role !== undefined ? { role } : {}),
           // An empty string means "no team" rather than a team literally named "".
           ...(team !== undefined ? { team: team === null || team.trim() === "" ? null : team.trim() } : {}),
           ...(status !== undefined ? { status } : {}),
         },
       });
+
+      // A suspension takes effect now, not at the end of their session.
+      let endedSessions = 0;
+      if (status === "suspended") {
+        const running = await fastify.prisma.session.findMany({
+          where: { userId: id, status: { in: ["pending", "active"] } },
+          select: { id: true },
+        });
+        for (const s of running) await endSession(fastify.prisma, s.id, "account_suspended");
+        endedSessions = running.length;
+      }
+
+      const who = { id: actor.id, label: actor.email };
+      const targetRef = { type: "user" as const, id, label: target.email };
+      if (status !== undefined && status !== target.status) {
+        await audit(fastify.prisma, {
+          actor: who,
+          action: status === "suspended" ? "user.suspended" : "user.reinstated",
+          severity: status === "suspended" ? "warn" : "info",
+          target: targetRef,
+          details: status === "suspended" ? { endedSessions } : {},
+        }, request.log);
+      }
+      const newTeam = team === undefined ? undefined : team === null || team.trim() === "" ? null : team.trim();
+      if (newTeam !== undefined && newTeam !== target.team) {
+        await audit(fastify.prisma, {
+          actor: who,
+          action: "user.team_changed",
+          target: targetRef,
+          details: { from: target.team, to: newTeam },
+        }, request.log);
+      }
 
       const operator = await getOperator(fastify.prisma, id);
       if (operator === null) return reply.code(404).send({ error: "operator_not_found" });
@@ -305,6 +339,13 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
       await fastify.prisma.ledgerEntry.create({
         data: { userId: id, type: "topup", amount: amount.toFixed(4) },
       });
+      const granter = getAuthUser(request);
+      await audit(fastify.prisma, {
+        actor: { id: granter.id, label: granter.email },
+        action: "credit.granted",
+        target: { type: "user", id, label: target.email },
+        details: { amount },
+      }, request.log);
 
       const operator = await getOperator(fastify.prisma, id);
       if (operator === null) return reply.code(404).send({ error: "operator_not_found" });

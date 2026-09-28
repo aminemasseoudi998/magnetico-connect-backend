@@ -3,43 +3,77 @@ import { requireAuth } from "../plugins/auth.js";
 import { getAuthUser } from "../plugins/auth-types.js";
 import {
   errorResponseSchema,
+  healthViewSchema,
   protocolSchema,
   sessionStatusSchema,
 } from "../plugins/swagger.js";
-import { getBalance } from "../services/wallet.js";
+import { healthOf } from "../services/metrics.js";
 import {
-  buildGuacPayload,
-  getConnectionParams,
-  getGuacUrl,
-  getJsonSecretKey,
-  signGuacToken,
-  signGuacTokenStub,
-} from "../services/guac-token.js";
+  availableCredit,
+  endSession,
+  finalizeSession,
+  liveRegistry,
+  sessionRate,
+  watchRegistry,
+} from "../services/live-sessions.js";
+import { isConfigured, minCap, readSettings } from "../services/servers.js";
+import { issueTicket, revokeTickets } from "../services/tunnel-tickets.js";
+import { HOLD_CHUNK_MINUTES, MIN_CREDIT_SECONDS } from "./tunnel.js";
 
-/**
- * How many minutes of `rate_per_minute` the POST /api/sessions hold reserves.
- * Capped by the remaining balance, so a low balance yields a smaller hold
- * instead of a rejection (rejection only happens at ~zero). Per-entitlement
- * `max_session_min` narrows it further when set.
- * TODO(tariffs): confirm the default hold window with the real tariff table.
- */
-const DEFAULT_HOLD_MINUTES = Number(process.env["HOLD_MINUTES_DEFAULT"] ?? 60);
+/** Public URL of the display WebSocket (routes/tunnel.ts), as browsers reach it. */
+function tunnelUrl(): string {
+  return process.env["TUNNEL_PUBLIC_URL"] ?? "ws://localhost:4000/api/tunnel";
+}
 
-class InsufficientBalanceError extends Error {
-  balance: number;
-  constructor(balance: number) {
-    super("insufficient balance");
-    this.balance = balance;
+const round4 = (n: number) => Math.round(n * 10000) / 10000;
+
+class OpenRefusal extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    readonly extra: Record<string, unknown> = {},
+  ) {
+    super(code);
   }
 }
 
+const liveSessionSchema = {
+  type: "object",
+  required: ["id", "status", "ratePerMinute", "holdAmount", "createdAt", "resource"],
+  properties: {
+    id: { type: "string" },
+    status: sessionStatusSchema,
+    ratePerMinute: { type: "number" },
+    holdAmount: { type: "number" },
+    maxSessionMin: { type: ["integer", "null"] },
+    startedAt: { type: ["string", "null"] },
+    endedAt: { type: ["string", "null"] },
+    finalCharge: { type: ["number", "null"] },
+    endReason: { type: ["string", "null"] },
+    /** Seconds of connection the user can still afford (credit + time cap). */
+    runwaySeconds: { type: ["number", "null"] },
+    /** Administrators watching this session right now (read-only). */
+    watchers: { type: "integer" },
+    createdAt: { type: "string" },
+    resource: {
+      type: "object",
+      required: ["id", "name", "protocol"],
+      properties: {
+        id: { type: "string" },
+        name: { type: "string" },
+        protocol: protocolSchema,
+      },
+    },
+  },
+} as const;
+
 export async function sessionRoutes(fastify: FastifyInstance): Promise<void> {
   /**
-   * 2. POST /api/sessions { resourceId } — entitlement + balance check, insert
-   * session (pending), write a 'hold' ledger entry, return a Guacamole token.
-   * The token is a real AES JSON-auth token when GUAC_JSON_AUTH_SECRET is set
-   * (step 7); without the secret it falls back to the dev stub so endpoint
-   * work doesn't block on a Guacamole stack.
+   * POST /api/sessions { resourceId } — open a metered session.
+   *
+   * Checks access and credit, reserves a hold (a chunk of credit, topped up
+   * while the session runs), and returns a one-time ticket for the display
+   * tunnel. Nothing Guacamole-related leaves the backend.
    */
   fastify.post<{ Body: { resourceId: string } }>(
     "/api/sessions",
@@ -49,118 +83,119 @@ export async function sessionRoutes(fastify: FastifyInstance): Promise<void> {
         tags: ["sessions"],
         summary: "Open a metered session",
         description:
-          "Checks entitlement + balance, inserts a pending session, writes a hold. " +
-          "Returns a Guacamole JSON-auth token (real when GUAC_JSON_AUTH_SECRET is set, stub otherwise).",
+          "Checks access + credit, inserts a pending session with a hold, and returns a " +
+          "single-use ticket (60 s) for the display WebSocket at `tunnel.url`.",
         body: {
           type: "object",
           required: ["resourceId"],
           additionalProperties: false,
-          properties: { resourceId: { type: "string", minLength: 1 } },
+          properties: { resourceId: { type: "string", format: "uuid" } },
         },
         response: {
           201: {
             type: "object",
-            required: ["sessionId", "guacToken", "guacUrl"],
+            required: ["session", "tunnel"],
             properties: {
-              sessionId: { type: "string" },
-              guacToken: { type: "string" },
-              guacUrl: { type: "string" },
+              session: liveSessionSchema,
+              tunnel: {
+                type: "object",
+                required: ["url", "ticket", "expiresAt"],
+                properties: {
+                  url: { type: "string" },
+                  ticket: { type: "string" },
+                  expiresAt: { type: "string" },
+                },
+              },
             },
           },
-          400: errorResponseSchema,
           402: errorResponseSchema,
           403: errorResponseSchema,
           404: errorResponseSchema,
+          409: errorResponseSchema,
         },
       },
     },
     async (request, reply) => {
       const user = getAuthUser(request);
+      const prisma = fastify.prisma;
 
-      const resource = await fastify.prisma.resource.findUnique({
-        where: { id: request.body.resourceId },
-      });
-      if (resource === null) {
+      const server = await prisma.resource.findUnique({ where: { id: request.body.resourceId } });
+      if (server === null || server.archivedAt !== null) {
         return reply.code(404).send({ error: "resource_not_found" });
       }
-      if (!resource.active) {
-        return reply.code(403).send({ error: "resource_inactive" });
-      }
+      if (!server.active) return reply.code(403).send({ error: "resource_inactive" });
+      if (!isConfigured(server)) return reply.code(409).send({ error: "server_not_configured" });
 
-      const entitlement = await fastify.prisma.entitlement.findUnique({
-        where: { userId_resourceId: { userId: user.id, resourceId: resource.id } },
+      const entitlement = await prisma.entitlement.findUnique({
+        where: { userId_resourceId: { userId: user.id, resourceId: server.id } },
       });
-      if (entitlement === null) {
+      if (!server.openToAll && entitlement === null) {
         return reply.code(403).send({ error: "no_entitlement" });
       }
 
-      // NOTE(race, step 14): check-then-write inside one interactive transaction
-      // narrows but does not eliminate double-spend under concurrency. The
-      // billing daemon (step 9) reconciles against actual usage; a serializable
-      // hold with row locking is hardening work, not PoC work.
+      // One live session per user per server. A pending one whose ticket was
+      // never used (reload, double click) is replaced; a connected one is not.
+      const existing = await prisma.session.findMany({
+        where: { userId: user.id, resourceId: server.id, status: { in: ["pending", "active"] } },
+      });
+      for (const s of existing) {
+        if (s.status === "active" || liveRegistry.has(s.id)) {
+          return reply.code(409).send({ error: "session_already_open", sessionId: s.id });
+        }
+        revokeTickets(s.id);
+        await finalizeSession(prisma, s.id, "never_connected");
+      }
+
+      const rate = Number(server.ratePerMinute);
+      const capMinutes = minCap(server.maxSessionMin, entitlement?.maxSessionMin ?? null);
+
       try {
-        const { session } = await fastify.prisma.$transaction(async (tx) => {
-          const balance = await getBalance(tx, user.id);
-          const holdMinutes = entitlement.maxSessionMin ?? DEFAULT_HOLD_MINUTES;
-          const rate = Number(resource.ratePerMinute);
-          const holdAmount =
-            Math.round(Math.min(balance, rate * holdMinutes) * 10000) / 10000;
-          if (!Number.isFinite(holdAmount) || holdAmount <= 0) {
-            throw new InsufficientBalanceError(balance);
+        // NOTE(race, step 14): check-then-write; a serializable transaction
+        // with row locks would close the double-spend window completely.
+        const session = await prisma.$transaction(async (tx) => {
+          const free = await availableCredit(tx, user.id);
+          if (free < (rate * MIN_CREDIT_SECONDS) / 60) {
+            throw new OpenRefusal(402, "insufficient_balance", { balance: free });
           }
+          const minutes = Math.min(HOLD_CHUNK_MINUTES, capMinutes ?? Infinity);
+          const hold = round4(Math.min(free, rate * minutes));
           const created = await tx.session.create({
             data: {
               userId: user.id,
-              resourceId: resource.id,
-              holdAmount: holdAmount.toFixed(4),
+              resourceId: server.id,
+              holdAmount: hold.toFixed(4),
+              ratePerMinute: server.ratePerMinute,
+              recorded: readSettings(server.settings).recording,
               status: "pending",
             },
           });
           await tx.ledgerEntry.create({
-            data: {
-              userId: user.id,
-              sessionId: created.id,
-              type: "hold",
-              amount: holdAmount.toFixed(4),
-            },
+            data: { userId: user.id, sessionId: created.id, type: "hold", amount: hold.toFixed(4) },
           });
-          return { session: created, balance };
+          return created;
         });
 
-        let guacToken: string;
-        if (process.env["GUAC_JSON_AUTH_SECRET"] === undefined) {
-          request.log.warn("sessions: GUAC_JSON_AUTH_SECRET unset — returning stub token (dev only)");
-          guacToken = signGuacTokenStub({
-            connectionId: resource.guacConnectionId,
-            userId: user.id,
-            sessionId: session.id,
-          });
-        } else {
-          try {
-            const payload = buildGuacPayload({
-              sessionId: session.id,
-              connectionName: resource.guacConnectionId,
-              protocol: resource.protocol,
-              parameters: getConnectionParams(resource.guacConnectionId),
-            });
-            guacToken = signGuacToken(payload, getJsonSecretKey());
-          } catch (err) {
-            request.log.error({ err }, "sessions: Guacamole token signing failed");
-            return reply
-              .code(500)
-              .send({ error: "guac_token_failed", detail: (err as Error).message });
-          }
-        }
+        const { ticket, expiresAt } = issueTicket(session.id, user.id);
         return reply.code(201).send({
-          sessionId: session.id,
-          guacToken,
-          guacUrl: getGuacUrl(resource.guacConnectionId, guacToken),
+          session: {
+            id: session.id,
+            status: session.status,
+            ratePerMinute: rate,
+            holdAmount: Number(session.holdAmount),
+            maxSessionMin: capMinutes,
+            startedAt: null,
+            endedAt: null,
+            finalCharge: null,
+            endReason: null,
+            runwaySeconds: null,
+            createdAt: session.createdAt.toISOString(),
+            resource: { id: server.id, name: server.name, protocol: server.protocol },
+          },
+          tunnel: { url: tunnelUrl(), ticket, expiresAt: expiresAt.toISOString() },
         });
       } catch (err) {
-        if (err instanceof InsufficientBalanceError) {
-          return reply
-            .code(402)
-            .send({ error: "insufficient_balance", balance: err.balance });
+        if (err instanceof OpenRefusal) {
+          return reply.code(err.status).send({ error: err.code, ...err.extra });
         }
         throw err;
       }
@@ -168,7 +203,146 @@ export async function sessionRoutes(fastify: FastifyInstance): Promise<void> {
   );
 
   /**
-   * 5. GET /api/sessions/history — past sessions with resource + final_charge.
+   * GET /api/sessions/:id — live status for the session page's meter, which
+   * polls it: holds grow when credit is topped up, and the server may end a
+   * session (credit, time cap, admin) at any moment.
+   */
+  fastify.get<{ Params: { id: string } }>(
+    "/api/sessions/:id",
+    {
+      preHandler: [requireAuth],
+      schema: {
+        tags: ["sessions"],
+        summary: "One session (live status)",
+        params: {
+          type: "object",
+          required: ["id"],
+          properties: { id: { type: "string", format: "uuid" } },
+        },
+        response: {
+          200: { type: "object", required: ["session"], properties: { session: liveSessionSchema } },
+          404: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const user = getAuthUser(request);
+      const session = await fastify.prisma.session.findUnique({
+        where: { id: request.params.id },
+        include: { resource: true },
+      });
+      if (session === null || session.userId !== user.id) {
+        return reply.code(404).send({ error: "session_not_found" });
+      }
+
+      const rate = sessionRate(session, session.resource.ratePerMinute);
+      const entitlement = await fastify.prisma.entitlement.findUnique({
+        where: { userId_resourceId: { userId: user.id, resourceId: session.resourceId } },
+      });
+      const capMinutes = minCap(session.resource.maxSessionMin, entitlement?.maxSessionMin ?? null);
+
+      let runwaySeconds: number | null = null;
+      if (session.status === "active" && session.startedAt !== null) {
+        const elapsed = (Date.now() - session.startedAt.getTime()) / 1000;
+        const free = await availableCredit(fastify.prisma, user.id);
+        const creditSeconds = ((Number(session.holdAmount) + Math.max(0, free)) / rate) * 60 - elapsed;
+        const capSeconds = capMinutes === null ? Infinity : capMinutes * 60 - elapsed;
+        runwaySeconds = Math.max(0, Math.round(Math.min(creditSeconds, capSeconds)));
+      }
+
+      return {
+        session: {
+          id: session.id,
+          status: session.status,
+          ratePerMinute: rate,
+          holdAmount: Number(session.holdAmount),
+          maxSessionMin: capMinutes,
+          startedAt: session.startedAt?.toISOString() ?? null,
+          endedAt: session.endedAt?.toISOString() ?? null,
+          finalCharge: session.finalCharge === null ? null : Number(session.finalCharge),
+          endReason: session.endReason,
+          runwaySeconds,
+          watchers: watchRegistry.count(session.id),
+          createdAt: session.createdAt.toISOString(),
+          resource: {
+            id: session.resource.id,
+            name: session.resource.name,
+            protocol: session.resource.protocol,
+          },
+        },
+      };
+    },
+  );
+
+  /**
+   * GET /api/sessions/:id/health — health of the server behind my session
+   * (only while it is open, and only if the admin enabled monitoring).
+   */
+  fastify.get<{ Params: { id: string } }>(
+    "/api/sessions/:id/health",
+    {
+      preHandler: [requireAuth],
+      schema: {
+        tags: ["sessions"],
+        summary: "Health of my session's server",
+        params: {
+          type: "object",
+          required: ["id"],
+          properties: { id: { type: "string", format: "uuid" } },
+        },
+        response: { 200: healthViewSchema, 404: errorResponseSchema },
+      },
+    },
+    async (request, reply) => {
+      const user = getAuthUser(request);
+      const session = await fastify.prisma.session.findUnique({
+        where: { id: request.params.id },
+        include: { resource: true },
+      });
+      if (session === null || session.userId !== user.id) {
+        return reply.code(404).send({ error: "session_not_found" });
+      }
+      if (session.status !== "pending" && session.status !== "active") {
+        return { mode: "off", samples: [], latest: null, lastError: null };
+      }
+      return healthOf(session.resource, 60);
+    },
+  );
+
+  /** POST /api/sessions/:id/close — the user ends their own session. */
+  fastify.post<{ Params: { id: string } }>(
+    "/api/sessions/:id/close",
+    {
+      preHandler: [requireAuth],
+      schema: {
+        tags: ["sessions"],
+        summary: "End my session",
+        description: "Closes the display tunnel and bills the connected time.",
+        params: {
+          type: "object",
+          required: ["id"],
+          properties: { id: { type: "string", format: "uuid" } },
+        },
+        response: {
+          204: { type: "null" },
+          404: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const user = getAuthUser(request);
+      const session = await fastify.prisma.session.findUnique({ where: { id: request.params.id } });
+      if (session === null || session.userId !== user.id) {
+        return reply.code(404).send({ error: "session_not_found" });
+      }
+      revokeTickets(session.id);
+      await endSession(fastify.prisma, session.id, "user_closed");
+      return reply.code(204).send();
+    },
+  );
+
+  /**
+   * GET /api/sessions/history — past sessions with resource + final_charge.
    */
   fastify.get<{ Querystring: { limit?: number } }>(
     "/api/sessions/history",
@@ -205,6 +379,8 @@ export async function sessionRoutes(fastify: FastifyInstance): Promise<void> {
                     holdAmount: { type: "number" },
                     finalCharge: { type: ["number", "null"] },
                     guacHistoryRef: { type: ["string", "null"] },
+                    endReason: { type: ["string", "null"] },
+                    ratePerMinute: { type: "number" },
                     startedAt: { type: ["string", "null"] },
                     endedAt: { type: ["string", "null"] },
                     createdAt: { type: "string" },
@@ -243,6 +419,8 @@ export async function sessionRoutes(fastify: FastifyInstance): Promise<void> {
           holdAmount: Number(s.holdAmount),
           finalCharge: s.finalCharge === null ? null : Number(s.finalCharge),
           guacHistoryRef: s.guacHistoryRef,
+          endReason: s.endReason,
+          ratePerMinute: sessionRate(s, s.resource.ratePerMinute),
           startedAt: s.startedAt?.toISOString() ?? null,
           endedAt: s.endedAt?.toISOString() ?? null,
           createdAt: s.createdAt.toISOString(),

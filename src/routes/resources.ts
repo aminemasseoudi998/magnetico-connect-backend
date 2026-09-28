@@ -2,11 +2,14 @@ import type { FastifyInstance } from "fastify";
 import { requireAuth } from "../plugins/auth.js";
 import { getAuthUser } from "../plugins/auth-types.js";
 import { protocolSchema } from "../plugins/swagger.js";
+import { isConfigured, userView } from "../services/servers.js";
 
 /**
- * 1. GET /api/resources — resources the authenticated user is entitled to.
- * Only active resources are returned; entitlement rows pointing at a
- * deactivated resource are hidden (not deleted) so reactivation restores them.
+ * GET /api/resources — servers the authenticated user may connect to.
+ *
+ * Visible = active, configured, not archived, and either open to everyone
+ * or granted to this user. The response is the user view: name, protocol,
+ * price and limits — never the hostname, port, username or credentials.
  */
 export async function resourceRoutes(fastify: FastifyInstance): Promise<void> {
   fastify.get(
@@ -15,8 +18,10 @@ export async function resourceRoutes(fastify: FastifyInstance): Promise<void> {
       preHandler: [requireAuth],
       schema: {
         tags: ["resources"],
-        summary: "List entitled resources",
-        description: "Resources the authenticated user is entitled to (active only).",
+        summary: "List servers I can use",
+        description:
+          "Active servers open to everyone or granted to the caller. Connection details " +
+          "(host, port, credentials) are never included.",
         response: {
           200: {
             type: "object",
@@ -26,22 +31,16 @@ export async function resourceRoutes(fastify: FastifyInstance): Promise<void> {
                 type: "array",
                 items: {
                   type: "object",
-                  required: [
-                    "id",
-                    "name",
-                    "protocol",
-                    "tier",
-                    "guacConnectionId",
-                    "ratePerMinute",
-                  ],
+                  required: ["id", "name", "protocol", "tier", "ratePerMinute"],
                   properties: {
                     id: { type: "string" },
                     name: { type: "string" },
+                    description: { type: ["string", "null"] },
                     protocol: protocolSchema,
                     tier: { type: "string" },
-                    guacConnectionId: { type: "string" },
                     ratePerMinute: { type: "number" },
                     maxSessionMin: { type: ["integer", "null"] },
+                    recorded: { type: "boolean" },
                   },
                 },
               },
@@ -51,26 +50,23 @@ export async function resourceRoutes(fastify: FastifyInstance): Promise<void> {
       },
     },
     async (request) => {
-    const user = getAuthUser(request);
+      const user = getAuthUser(request);
 
-    const entitlements = await fastify.prisma.entitlement.findMany({
-      where: { userId: user.id },
-      include: { resource: true },
-      orderBy: { resource: { name: "asc" } },
-    });
+      const servers = await fastify.prisma.resource.findMany({
+        where: {
+          active: true,
+          archivedAt: null,
+          OR: [{ openToAll: true }, { entitlements: { some: { userId: user.id } } }],
+        },
+        include: { entitlements: { where: { userId: user.id } } },
+        orderBy: { name: "asc" },
+      });
 
-    return {
-      resources: entitlements
-        .filter((e) => e.resource.active)
-        .map((e) => ({
-          id: e.resource.id,
-          name: e.resource.name,
-          protocol: e.resource.protocol,
-          tier: e.resource.tier,
-          guacConnectionId: e.resource.guacConnectionId,
-          ratePerMinute: Number(e.resource.ratePerMinute),
-          maxSessionMin: e.maxSessionMin,
-        })),
-    };
-  });
+      return {
+        resources: servers
+          .filter(isConfigured)
+          .map((s) => userView(s, s.entitlements[0]?.maxSessionMin ?? null)),
+      };
+    },
+  );
 }

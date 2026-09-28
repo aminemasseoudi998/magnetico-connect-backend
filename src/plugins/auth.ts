@@ -13,10 +13,9 @@ import { resolveUser, UserConflictError } from "../services/users.js";
  * cached by jose), with issuer + audience + expiry checks. The `sub` claim is
  * then upserted into `users` and the row id is attached as `request.user.id`.
  *
- * Roles live in `users.role`, not in the token: the realm role only seeds a
- * brand-new row (see services/users.ts). `requireAdmin` therefore reads the
- * stored role, so a promotion or demotion made in the admin console takes
- * effect on the holder's next request rather than their next sign-in.
+ * Roles come from the token's Keycloak realm roles (`admin` > `user`) and are
+ * copied onto `users.role` on every request, so the portal DB always mirrors
+ * Keycloak. A token with neither role is refused (403 no_role).
  *
  * Contract:
  *   - protected routes declare `preHandler: [requireAuth]`
@@ -26,7 +25,9 @@ import { resolveUser, UserConflictError } from "../services/users.js";
  *   - 403 { error: "forbidden" | "no_role" | "account_suspended" }
  */
 
-const PUBLIC_PATHS = new Set(["/api/health"]);
+// /api/tunnel is a WebSocket authenticated by a one-time ticket instead of a
+// Bearer header (browsers cannot set one on a WebSocket) — see routes/tunnel.ts.
+const PUBLIC_PATHS = new Set(["/api/health", "/api/tunnel", "/api/tunnel/watch"]);
 
 type KeycloakClaims = JWTPayload & {
   email?: string;
@@ -61,15 +62,11 @@ function getVerifier(): Verifier {
   return verifier;
 }
 
-/**
- * Role to give a brand-new `users` row, or null when the token carries no
- * portal realm role at all (-> 403 no_role). Existing rows keep their stored
- * role regardless of what the token says.
- */
-export function seedRoleFromClaims(claims: KeycloakClaims): PortalRole | null {
+/** Portal role from the Keycloak realm roles, or null when it has neither. */
+export function roleFromClaims(claims: KeycloakClaims): PortalRole | null {
   const roles = claims.realm_access?.roles ?? [];
   if (roles.includes("admin")) return "admin";
-  if (roles.includes("user")) return "engineer";
+  if (roles.includes("user")) return "user";
   return null;
 }
 
@@ -115,8 +112,8 @@ export async function requireAuth(
     return reply.code(401).send({ error: "unauthorized" });
   }
 
-  const seedRole = seedRoleFromClaims(claims);
-  if (seedRole === null) {
+  const role = roleFromClaims(claims);
+  if (role === null) {
     return reply.code(403).send({ error: "no_role" });
   }
 
@@ -127,7 +124,7 @@ export async function requireAuth(
       email: claims.email,
       emailVerified: claims.email_verified === true,
       displayName: claims.name ?? claims.preferred_username ?? claims.email,
-      seedRole,
+      role,
     });
   } catch (err) {
     if (err instanceof UserConflictError) {
@@ -144,8 +141,7 @@ export async function requireAuth(
     keycloakSub: user.keycloakSub,
     email: user.email,
     displayName: user.displayName,
-    // Stored role wins over the token — see the module comment.
-    role: user.role,
+    role,
   };
   request.user = authUser;
 }
@@ -157,6 +153,8 @@ export async function requireAdmin(
 ): Promise<FastifyReply | void> {
   const denied = await requireAuth(request, reply);
   if (denied !== undefined) return denied;
+  // requireAuth may already have answered 401 without returning the reply.
+  if (reply.sent) return reply;
   if (request.user?.role !== "admin") {
     return reply.code(403).send({ error: "forbidden" });
   }
