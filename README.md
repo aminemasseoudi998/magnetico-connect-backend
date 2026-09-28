@@ -193,3 +193,5 @@ and never count in the balance.
   differs from the token `iss` (`localhost` vs `127.0.0.1`, missing `/auth`).
 - **403 `no_role`** — the Keycloak user has neither `user` nor `admin`.
 - **`P2021 table … does not exist`** — run `npx prisma migrate deploy`.
+
+
