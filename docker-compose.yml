@@ -1,12 +1,11 @@
-# Magnetico — identity + portal database.
-#
-# Scope for now: Google sign-in through Keycloak, and the Portal Postgres.
-# Guacamole, guacd, billing-daemon and nginx join this file later.
+# Magnetico — identity, portal database and remote-access gateway.
 #
 #   cp .env.example .env    # fill in the Google OAuth client + secrets
 #   docker compose up -d
 #
 # Host ports: 5432 portal-db · 8180 Keycloak (http://localhost:8180/auth)
+#             127.0.0.1:8085 Guacamole admin dashboard (loopback only)
+# nginx and the billing daemon join this file later.
 
 name: magnetico
 
@@ -84,6 +83,84 @@ services:
     volumes:
       - ./keycloak/magnetico-realm.json:/opt/keycloak/data/import/magnetico-realm.json:ro
 
+  # ---- Remote access ------------------------------------------------------
+  # guacd speaks SSH/RDP to the real servers. It is the only container that
+  # needs to reach them, and it sits on its own network: no route to the
+  # portal database or Keycloak.
+  guacd:
+    image: guacamole/guacd:1.6.0
+    restart: unless-stopped
+    environment:
+      GUACD_LOG_LEVEL: info
+    # Lets a server running on this Docker host be added as
+    # "host.docker.internal" (Docker Desktop has it; Linux needs this line).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Session recordings (servers with "Record sessions" on) land here, one
+    # folder per session. Shared with Guacamole (replay in its History) and
+    # read by the backend on the host (replay in Admin → Sessions).
+    volumes:
+      - ./recordings:/var/lib/guacamole/recordings
+    networks: [remote-access]
+
+  # Guacamole's own database: connections (synced from the portal's Admin →
+  # Servers), per-user accounts, active sessions and history. Initialised once
+  # from guacamole-db/ (official schema + your admin + the backend's service
+  # account). It stores connection passwords — never publish it.
+  guac-db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: guacamole_db
+      POSTGRES_USER: guacamole
+      POSTGRES_PASSWORD: ${GUAC_DB_PASSWORD:?set GUAC_DB_PASSWORD in infra/.env}
+      GUAC_ADMIN_USER: ${GUAC_ADMIN_USER:-guacadmin}
+      GUAC_ADMIN_PASSWORD: ${GUAC_ADMIN_PASSWORD:?set GUAC_ADMIN_PASSWORD in infra/.env}
+      GUAC_SERVICE_USER: ${GUAC_SERVICE_USER:-magnetico-portal}
+      GUAC_SERVICE_PASSWORD: ${GUAC_SERVICE_PASSWORD:?set GUAC_SERVICE_PASSWORD in infra/.env}
+    volumes:
+      - guac-db-data:/var/lib/postgresql/data
+      - ./guacamole-db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U guacamole -d guacamole_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [remote-access]
+
+  # Guacamole with its database: servers added in the portal appear here as
+  # connections (group "Magnetico"), with live sessions and history per user.
+  # Admin dashboard: http://localhost:8085/guacamole (GUAC_ADMIN_USER).
+  # Users never come here — the portal proxies their sessions.
+  # Loopback only: the dashboard and API must not be reachable from the LAN.
+  guacamole:
+    image: guacamole/guacamole:1.6.0
+    restart: unless-stopped
+    depends_on:
+      guacd:
+        condition: service_started
+      guac-db:
+        condition: service_healthy
+    environment:
+      GUACD_HOSTNAME: guacd
+      GUACD_PORT: "4822"
+      POSTGRESQL_HOSTNAME: guac-db
+      POSTGRESQL_DATABASE: guacamole_db
+      POSTGRESQL_USERNAME: guacamole
+      POSTGRESQL_PASSWORD: ${GUAC_DB_PASSWORD:?set GUAC_DB_PASSWORD in infra/.env}
+      # Enables guacamole-history-recording-storage: recordings become
+      # playable from Guacamole's History screen.
+      RECORDING_SEARCH_PATH: /var/lib/guacamole/recordings
+    volumes:
+      - ./recordings:/var/lib/guacamole/recordings:ro
+    ports:
+      - "127.0.0.1:8085:8080"
+    networks: [remote-access]
+
 volumes:
   portal-db-data:
   keycloak-db-data:
+  guac-db-data:
+
+networks:
+  remote-access:
